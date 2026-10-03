@@ -1,0 +1,42 @@
+name: Build Windows apps
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Build employee and manager apps
+        shell: pwsh
+        run: ./tool/build_windows_apps.ps1
+
+      - name: Upload employee app
+        uses: actions/upload-artifact@v4
+        with:
+          name: employee-app-windows
+          path: dist/employee/
+          if-no-files-found: error
+
+      - name: Upload manager app
+        uses: actions/upload-artifact@v4
+        with:
+          name: manager-app-windows
+          path: dist/manager/
+          if-no-files-found: error
