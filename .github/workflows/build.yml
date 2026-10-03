@@ -19,6 +19,11 @@ jobs:
       - run: flutter pub get
       - run: flutter build windows --release
 
+      # نسخ ملف الـ DLL المطلوبة إلى مجلد الـ Release تلقائياً
+      - name: Copy VC++ Runtime DLLs
+        run: |
+          cp "C:\Windows\System32\vcruntime140_1.dll" "build\windows\runner\Release\" -ErrorAction SilentlyContinue
+
       - uses: actions/upload-artifact@v3
         with:
           name: Windows-EXE
