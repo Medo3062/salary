@@ -1,14 +1,52 @@
+import 'dart:io';
+
 import 'package:employee_salary/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:intl/date_symbol_data_local.dart';
+import 'package:intl/intl.dart';
 
 class _NoopMonthStore extends MonthStore {
   @override
   Future<void> save(MonthRecord record) async {}
 }
 
+class _InMemoryAttendanceModeStore extends AttendanceModeStore {
+  AttendanceMode mode = AttendanceMode.optional;
+
+  @override
+  Future<AttendanceMode> load() async => mode;
+
+  @override
+  Future<void> save(AttendanceMode mode) async {
+    this.mode = mode;
+  }
+}
+
+class _EmptyEmployeeStore extends EmployeeStore {
+  @override
+  Future<List<EmployeeRecord>> loadEmployees() async => [];
+}
+
 void main() {
+  test('attendance mode defaults to optional and persists independently',
+      () async {
+    final directory = await Directory.systemTemp.createTemp('salary-mode-');
+    try {
+      final store = AttendanceModeStore(directory: directory);
+      expect(await store.load(), AttendanceMode.optional);
+
+      await store.save(AttendanceMode.mandatory);
+
+      expect(
+        await AttendanceModeStore(directory: directory).load(),
+        AttendanceMode.mandatory,
+      );
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
   group('DayRecord.hours', () {
     test('calculates a same-day shift to the minute', () {
       expect(
@@ -162,5 +200,145 @@ void main() {
     expect(find.text('إجمالي المرتب'), findsNothing);
     expect(find.text('مواعيد افتراضية للشهر'), findsNothing);
     expect(find.byType(TextField), findsNothing);
+  });
+
+  testWidgets('mandatory attendance records current time once for today', (
+    tester,
+  ) async {
+    await initializeDateFormatting('ar');
+    final now = DateTime.now();
+    final month = MonthRecord(
+      year: now.year,
+      month: now.month,
+      defaultArrival: '09:00',
+      defaultDeparture: '17:00',
+    );
+    final store = _NoopMonthStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MonthPage(
+          month: month,
+          store: store,
+          employeeMode: true,
+          attendanceMode: AttendanceMode.mandatory,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.textContaining(DateFormat('d/M/yyyy', 'ar').format(now)),
+      300,
+    );
+    expect(find.text('حضور'), findsOneWidget);
+    expect(find.text('انصراف'), findsOneWidget);
+    expect(find.byType(TimePickerDialog), findsNothing);
+    expect(month.defaultArrival, '09:00');
+    expect(month.defaultDeparture, '17:00');
+    expect(
+      find.text(
+        '${8 * (DateTime(now.year, now.month + 1, 0).day - 1)} ساعة',
+      ),
+      findsOneWidget,
+    );
+
+    await tester.tap(find.text('حضور'));
+    await tester.pumpAndSettle();
+
+    expect(
+      month.days[now.day]?.arrival,
+      matches(RegExp(r'^\d{2}:\d{2}$')),
+    );
+    expect(month.days[now.day]?.departure, isNull);
+    expect(month.defaultDeparture, '17:00');
+    final arrivalButton = tester.widget<FilledButton>(
+      find.ancestor(
+        of: find.text('حضور'),
+        matching: find.byType(FilledButton),
+      ),
+    );
+    expect(arrivalButton.onPressed, isNull);
+    expect(find.byType(TimePickerDialog), findsNothing);
+  });
+
+  testWidgets('manager can switch attendance mode for all employees', (
+    tester,
+  ) async {
+    final modeStore = _InMemoryAttendanceModeStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: EmployeesPage(
+          store: _EmptyEmployeeStore(),
+          attendanceModeStore: modeStore,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.widgetWithText(TextButton, 'نظام الحضور والانصراف'),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('نظام إجباري'));
+    await tester.tap(find.text('حفظ النظام'));
+    await tester.pumpAndSettle();
+
+    expect(modeStore.mode, AttendanceMode.mandatory);
+  });
+
+  testWidgets('employee screen applies manager mode changes before recording',
+      (tester) async {
+    await initializeDateFormatting('ar');
+    final now = DateTime.now();
+    final month = MonthRecord(year: now.year, month: now.month);
+    final modeStore = _InMemoryAttendanceModeStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MonthPage(
+          month: month,
+          store: _NoopMonthStore(),
+          employeeMode: true,
+          attendanceModeStore: modeStore,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.textContaining(DateFormat('d/M/yyyy', 'ar').format(now)),
+      300,
+    );
+    final todayCard = find.ancestor(
+      of: find.textContaining(DateFormat('d/M/yyyy', 'ar').format(now)),
+      matching: find.byType(Card),
+    );
+
+    modeStore.mode = AttendanceMode.mandatory;
+    await tester.tap(
+      find
+          .descendant(
+            of: todayCard.first,
+            matching: find.text('--:--'),
+          )
+          .first,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('حضور'), findsOneWidget);
+    expect(find.byType(TimePickerDialog), findsNothing);
+
+    modeStore.mode = AttendanceMode.optional;
+    await tester.tap(find.text('حضور'));
+    await tester.pumpAndSettle();
+    expect(month.days[now.day]?.arrival, isNull);
+    expect(find.text('حضور'), findsNothing);
+    await tester.tap(
+      find
+          .descendant(
+            of: todayCard.first,
+            matching: find.text('--:--'),
+          )
+          .first,
+    );
+    await tester.pumpAndSettle();
+    expect(find.byType(TimePickerDialog), findsOneWidget);
   });
 }

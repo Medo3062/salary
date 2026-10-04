@@ -16,6 +16,11 @@ class _FakeEmployeeStore extends EmployeeStore {
     _employees.add(employee);
     return employee;
   }
+
+  @override
+  Future<void> deleteEmployee(EmployeeRecord employee) async {
+    _employees.removeWhere((record) => record.id == employee.id);
+  }
 }
 
 void main() {
@@ -36,6 +41,29 @@ void main() {
 
     expect(find.text('Test Employee'), findsOneWidget);
     expect(find.byType(AlertDialog), findsNothing);
+  });
+
+  testWidgets('deleting an employee requires confirmation and refreshes list',
+      (tester) async {
+    final store = _FakeEmployeeStore();
+    await store.createEmployee('Employee to Delete');
+
+    await tester.pumpWidget(MaterialApp(home: EmployeesPage(store: store)));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('حذف موظف'));
+    await tester.pumpAndSettle();
+    expect(find.text('اختار الموظف المراد حذفه'), findsOneWidget);
+    await tester.tap(find.text('Employee to Delete').last);
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('كل الشهور وسجلات الحضور والرواتب'),
+        findsOneWidget);
+    await tester.tap(find.text('حذف نهائيًا'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Employee to Delete'), findsNothing);
+    expect(await store.loadEmployees(), isEmpty);
   });
 
   testWidgets('employee app shows employees created in the manager app', (
@@ -79,6 +107,30 @@ void main() {
             .having((record) => record.id, 'id', '2026-10')
             .having((record) => record.hourlyRate, 'hourlyRate', 50),
       ]);
+    } finally {
+      await directory.delete(recursive: true);
+    }
+  });
+
+  test('deleting an employee removes employee and month files', () async {
+    final directory = await Directory.systemTemp.createTemp('salary-delete-');
+    try {
+      final store = EmployeeStore(
+        directory: Directory('${directory.path}/employees'),
+      );
+      final employee = await store.createEmployee('Delete Me');
+      final monthsDirectory = await store.monthsDirectory(employee);
+      await MonthStore(directory: monthsDirectory).save(
+        MonthRecord(year: 2026, month: 10, hourlyRate: 50),
+      );
+
+      await store.deleteEmployee(employee);
+
+      expect(await store.loadEmployees(), isEmpty);
+      expect(
+          await Directory('${directory.path}/employees/${employee.id}')
+              .exists(),
+          isFalse);
     } finally {
       await directory.delete(recursive: true);
     }

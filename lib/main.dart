@@ -1,6 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
+import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:intl/date_symbol_data_local.dart';
@@ -73,6 +76,49 @@ class SharedSalaryDirectory {
   }
 }
 
+enum AttendanceMode { optional, mandatory }
+
+class AttendanceModeStore {
+  AttendanceModeStore({this.directory});
+
+  final Directory? directory;
+
+  Future<File> _settingsFile() async {
+    final customDirectory = directory;
+    if (customDirectory != null) {
+      await customDirectory.create(recursive: true);
+      return File('${customDirectory.path}/attendance_mode.json');
+    }
+    final sharedDirectory = await SharedSalaryDirectory.get();
+    final settingsDirectory = Directory('${sharedDirectory.path}/settings');
+    await settingsDirectory.create(recursive: true);
+    return File('${settingsDirectory.path}/attendance_mode.json');
+  }
+
+  Future<AttendanceMode> load() async {
+    final file = await _settingsFile();
+    if (!await file.exists()) return AttendanceMode.optional;
+    final decoded = jsonDecode(await file.readAsString());
+    if (decoded is! Map<String, dynamic>) {
+      throw const FormatException('Invalid attendance mode setting');
+    }
+    final json = decoded;
+    return switch (json['mode']) {
+      'optional' => AttendanceMode.optional,
+      'mandatory' => AttendanceMode.mandatory,
+      _ => throw const FormatException('Invalid attendance mode setting'),
+    };
+  }
+
+  Future<void> save(AttendanceMode mode) async {
+    final file = await _settingsFile();
+    await file.writeAsString(
+      jsonEncode({'mode': mode.name}),
+      flush: true,
+    );
+  }
+}
+
 class AppSettingsStore {
   AppSettingsStore({this.role, this.shared = false});
 
@@ -104,23 +150,94 @@ class AppSettingsStore {
     return AppSettings(
       role: role,
       name: (decoded['name'] as String?)?.trim(),
+      passwordSalt: decoded['passwordSalt'] as String?,
+      passwordHash: decoded['passwordHash'] as String?,
     );
   }
 
-  Future<void> saveSettings(AppRole role, String name) async {
+  Future<void> saveSettings(
+    AppRole role,
+    String name, {
+    String? passwordSalt,
+    String? passwordHash,
+  }) async {
     final file = await _settingsFile();
     await file.writeAsString(
-      jsonEncode({'role': role.name, 'name': name}),
+      jsonEncode({
+        'role': role.name,
+        'name': name,
+        if (passwordSalt != null) 'passwordSalt': passwordSalt,
+        if (passwordHash != null) 'passwordHash': passwordHash,
+      }),
       flush: true,
     );
   }
 }
 
 class AppSettings {
-  const AppSettings({required this.role, required this.name});
+  const AppSettings({
+    required this.role,
+    required this.name,
+    this.passwordSalt,
+    this.passwordHash,
+  });
 
   final AppRole role;
   final String? name;
+  final String? passwordSalt;
+  final String? passwordHash;
+
+  bool get hasPassword => passwordSalt != null && passwordHash != null;
+}
+
+class _PasswordCredential {
+  const _PasswordCredential({required this.salt, required this.hash});
+
+  final String salt;
+  final String hash;
+}
+
+Future<_PasswordCredential> _createPasswordCredential(String password) async {
+  final random = Random.secure();
+  final salt = List<int>.generate(16, (_) => random.nextInt(256));
+  final saltHex =
+      salt.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
+  final hash = await compute(_derivePasswordHash, [password, saltHex]);
+  return _PasswordCredential(salt: saltHex, hash: hash);
+}
+
+Future<bool> _verifyPassword(
+  String password,
+  String salt,
+  String expectedHash,
+) async {
+  final actualHash = await compute(_derivePasswordHash, [password, salt]);
+  if (actualHash.length != expectedHash.length) return false;
+  var difference = 0;
+  for (var index = 0; index < actualHash.length; index++) {
+    difference |= actualHash.codeUnitAt(index) ^ expectedHash.codeUnitAt(index);
+  }
+  return difference == 0;
+}
+
+String _derivePasswordHash(List<String> parameters) {
+  final password = utf8.encode(parameters[0]);
+  final salt = <int>[];
+  final saltHex = parameters[1];
+  for (var index = 0; index < saltHex.length; index += 2) {
+    salt.add(int.parse(saltHex.substring(index, index + 2), radix: 16));
+  }
+  final hmac = Hmac(sha256, password);
+  final block = [...salt, 0, 0, 0, 1];
+  var value = hmac.convert(block).bytes;
+  final result = List<int>.of(value);
+  for (var iteration = 1; iteration < 120000; iteration++) {
+    value = hmac.convert(value).bytes;
+    for (var index = 0; index < result.length; index++) {
+      result[index] ^= value[index];
+    }
+  }
+  return result.map((byte) => byte.toRadixString(16).padLeft(2, '0')).join();
 }
 
 class RoleGate extends StatefulWidget {
@@ -136,6 +253,9 @@ class _RoleGateState extends State<RoleGate> {
   late final AppSettingsStore _settings;
   late Future<AppSettings?> _settingsFuture;
   bool _promptingForName = false;
+  bool _promptingForPassword = false;
+  bool _managerUnlocked = false;
+  String? _managerPasswordSetupError;
 
   @override
   void initState() {
@@ -152,10 +272,34 @@ class _RoleGateState extends State<RoleGate> {
   Future<void> _selectRole(AppRole role) async {
     final name = await _requestName();
     if (name == null) return;
-    await _settings.saveSettings(role, name);
+    final credential = role == AppRole.manager
+        ? await _requestPassword(
+            title: 'إنشاء كلمة مرور المدير',
+            confirmPassword: true,
+            allowCancel: false,
+          )
+        : null;
+    if (role == AppRole.manager && credential == null) return;
+    final password = credential == null
+        ? null
+        : await _createPasswordCredential(credential.password!);
+    await _settings.saveSettings(
+      role,
+      name,
+      passwordSalt: password?.salt,
+      passwordHash: password?.hash,
+    );
     if (mounted) {
       setState(() {
-        _settingsFuture = Future.value(AppSettings(role: role, name: name));
+        _managerUnlocked = role == AppRole.manager;
+        _settingsFuture = Future.value(
+          AppSettings(
+            role: role,
+            name: name,
+            passwordSalt: password?.salt,
+            passwordHash: password?.hash,
+          ),
+        );
       });
     }
   }
@@ -166,6 +310,119 @@ class _RoleGateState extends State<RoleGate> {
         builder: (_) => const _UserNameDialog(),
       );
 
+  Future<_PasswordDialogResult?> _requestPassword({
+    required String title,
+    bool confirmPassword = false,
+    bool requireOldPassword = false,
+    bool allowCancel = true,
+    String? oldPasswordSalt,
+    String? oldPasswordHash,
+  }) =>
+      showDialog<_PasswordDialogResult>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => _PasswordDialog(
+          title: title,
+          confirmPassword: confirmPassword,
+          requireOldPassword: requireOldPassword,
+          allowCancel: allowCancel,
+          oldPasswordSalt: oldPasswordSalt,
+          oldPasswordHash: oldPasswordHash,
+        ),
+      );
+
+  Future<void> _requestMissingManagerPassword(AppSettings settings) async {
+    if (_promptingForPassword) return;
+    _promptingForPassword = true;
+    _managerPasswordSetupError = null;
+    final result = await _requestPassword(
+      title: 'إنشاء كلمة مرور المدير',
+      confirmPassword: true,
+      allowCancel: false,
+    );
+    if (result != null && mounted) {
+      try {
+        final password = await _createPasswordCredential(result.password!);
+        await _settings.saveSettings(
+          AppRole.manager,
+          settings.name!,
+          passwordSalt: password.salt,
+          passwordHash: password.hash,
+        );
+        if (mounted) {
+          setState(() {
+            _managerUnlocked = true;
+            _settingsFuture = Future.value(
+              AppSettings(
+                role: AppRole.manager,
+                name: settings.name,
+                passwordSalt: password.salt,
+                passwordHash: password.hash,
+              ),
+            );
+          });
+        }
+      } on FileSystemException catch (error) {
+        if (mounted) {
+          setState(() {
+            _managerPasswordSetupError =
+                'تعذر حفظ كلمة المرور: ${error.message}';
+          });
+        }
+      }
+    }
+    _promptingForPassword = false;
+  }
+
+  Future<bool> _unlockManager(AppSettings settings, String password) async {
+    final valid = await _verifyPassword(
+      password,
+      settings.passwordSalt!,
+      settings.passwordHash!,
+    );
+    if (valid && mounted) setState(() => _managerUnlocked = true);
+    return valid;
+  }
+
+  Future<void> _changeManagerPassword(AppSettings settings) async {
+    final result = await _requestPassword(
+      title: 'تعديل كلمة مرور المدير',
+      confirmPassword: true,
+      requireOldPassword: true,
+      oldPasswordSalt: settings.passwordSalt,
+      oldPasswordHash: settings.passwordHash,
+    );
+    if (result == null || !mounted) return;
+    try {
+      final password = await _createPasswordCredential(result.password!);
+      await _settings.saveSettings(
+        AppRole.manager,
+        settings.name!,
+        passwordSalt: password.salt,
+        passwordHash: password.hash,
+      );
+      if (!mounted) return;
+      setState(() {
+        _settingsFuture = Future.value(
+          AppSettings(
+            role: AppRole.manager,
+            name: settings.name,
+            passwordSalt: password.salt,
+            passwordHash: password.hash,
+          ),
+        );
+      });
+      ScaffoldMessenger.of(context)
+          .showSnackBar(const SnackBar(content: Text('تم تعديل كلمة المرور')));
+    } on FileSystemException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر حفظ كلمة المرور: ${error.message}')),
+        );
+      }
+    }
+  }
+
   void _requestMissingName(AppRole role) {
     if (_promptingForName) return;
     _promptingForName = true;
@@ -174,12 +431,36 @@ class _RoleGateState extends State<RoleGate> {
       final name = await _requestName();
       if (name != null) {
         try {
-          await _settings.saveSettings(role, name);
+          final credential = role == AppRole.manager
+              ? await _requestPassword(
+                  title: 'إنشاء كلمة مرور المدير',
+                  confirmPassword: true,
+                )
+              : null;
+          if (role == AppRole.manager && credential == null) {
+            _promptingForName = false;
+            return;
+          }
+          final password = credential == null
+              ? null
+              : await _createPasswordCredential(credential.password!);
+          await _settings.saveSettings(
+            role,
+            name,
+            passwordSalt: password?.salt,
+            passwordHash: password?.hash,
+          );
           if (mounted) {
             setState(() {
               _settingsFuture = Future.value(
-                AppSettings(role: role, name: name),
+                AppSettings(
+                  role: role,
+                  name: name,
+                  passwordSalt: password?.salt,
+                  passwordHash: password?.hash,
+                ),
               );
+              _managerUnlocked = role == AppRole.manager;
             });
           }
         } on FileSystemException catch (error) {
@@ -198,7 +479,10 @@ class _RoleGateState extends State<RoleGate> {
   @override
   Widget build(BuildContext context) {
     if (widget.fixedRole == AppRole.employee) {
-      return EmployeeSelectionPage(store: EmployeeStore(shared: true));
+      return EmployeeSelectionPage(
+        store: EmployeeStore(shared: true),
+        attendanceModeStore: AttendanceModeStore(),
+      );
     }
     return FutureBuilder<AppSettings?>(
       future: _settingsFuture,
@@ -225,11 +509,54 @@ class _RoleGateState extends State<RoleGate> {
             );
           }
           if (role == AppRole.manager) {
+            if (!settings.hasPassword) {
+              final setupError = _managerPasswordSetupError;
+              if (setupError != null) {
+                return Scaffold(
+                  body: Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            setupError,
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              color: Theme.of(context).colorScheme.error,
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          FilledButton(
+                            onPressed: () {
+                              setState(() => _managerPasswordSetupError = null);
+                              _requestMissingManagerPassword(settings);
+                            },
+                            child: const Text('إعادة المحاولة'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                );
+              }
+              _requestMissingManagerPassword(settings);
+              return const Scaffold(
+                body: Center(child: CircularProgressIndicator()),
+              );
+            }
+            if (!_managerUnlocked) {
+              return _ManagerLoginPage(
+                onSubmit: (password) => _unlockManager(settings, password),
+              );
+            }
             return EmployeesPage(
               store: widget.fixedRole == AppRole.manager
                   ? EmployeeStore(shared: true)
                   : null,
               userName: name,
+              onChangePassword: () => _changeManagerPassword(settings),
+              attendanceModeStore: AttendanceModeStore(),
             );
           }
           if (role == AppRole.employee) return MonthsPage(userName: name);
@@ -285,11 +612,254 @@ class _UserNameDialogState extends State<_UserNameDialog> {
           ),
         ),
         actions: [
+          FilledButton(onPressed: _submit, child: const Text('متابعة')),
+        ],
+      ),
+    );
+  }
+}
+
+class _PasswordDialogResult {
+  const _PasswordDialogResult(this.password, {this.remove = false});
+
+  final String? password;
+  final bool remove;
+}
+
+class _PasswordDialog extends StatefulWidget {
+  const _PasswordDialog({
+    required this.title,
+    this.confirmPassword = false,
+    this.requireOldPassword = false,
+    this.removePassword = false,
+    this.allowCancel = true,
+    this.oldPasswordSalt,
+    this.oldPasswordHash,
+  });
+
+  final String title;
+  final bool confirmPassword;
+  final bool requireOldPassword;
+  final bool removePassword;
+  final bool allowCancel;
+  final String? oldPasswordSalt;
+  final String? oldPasswordHash;
+
+  @override
+  State<_PasswordDialog> createState() => _PasswordDialogState();
+}
+
+class _PasswordDialogState extends State<_PasswordDialog> {
+  final _formKey = GlobalKey<FormState>();
+  final _oldPasswordController = TextEditingController();
+  final _passwordController = TextEditingController();
+  final _confirmationController = TextEditingController();
+  String? _error;
+  bool _saving = false;
+
+  @override
+  void dispose() {
+    _oldPasswordController.dispose();
+    _passwordController.dispose();
+    _confirmationController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() {
+      _saving = true;
+      _error = null;
+    });
+    if (widget.requireOldPassword &&
+        !await _verifyPassword(
+          _oldPasswordController.text,
+          widget.oldPasswordSalt!,
+          widget.oldPasswordHash!,
+        )) {
+      if (mounted) {
+        setState(() {
+          _saving = false;
+          _error = 'كلمة المرور القديمة غير صحيحة';
+        });
+      }
+      return;
+    }
+    if (widget.removePassword) {
+      if (mounted) {
+        Navigator.of(context)
+            .pop(const _PasswordDialogResult(null, remove: true));
+      }
+      return;
+    }
+    if (mounted) {
+      Navigator.of(context)
+          .pop(_PasswordDialogResult(_passwordController.text));
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: widget.allowCancel,
+      child: AlertDialog(
+        title: Text(widget.title),
+        content: Form(
+          key: _formKey,
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (widget.requireOldPassword) ...[
+                TextFormField(
+                  controller: _oldPasswordController,
+                  autofocus: true,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'كلمة المرور القديمة',
+                  ),
+                  validator: (value) => value == null || value.isEmpty
+                      ? 'اكتب كلمة المرور القديمة'
+                      : null,
+                ),
+                const SizedBox(height: 12),
+              ],
+              if (!widget.removePassword)
+                TextFormField(
+                  controller: _passwordController,
+                  autofocus: !widget.requireOldPassword,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'كلمة المرور الجديدة',
+                  ),
+                  validator: (value) => value == null || value.length < 4
+                      ? 'كلمة المرور لازم تكون ٤ أحرف على الأقل'
+                      : null,
+                  onFieldSubmitted: (_) {
+                    if (widget.confirmPassword) _submit();
+                  },
+                ),
+              if (widget.confirmPassword && !widget.removePassword) ...[
+                const SizedBox(height: 12),
+                TextFormField(
+                  controller: _confirmationController,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'تأكيد كلمة المرور الجديدة',
+                  ),
+                  validator: (value) => value != _passwordController.text
+                      ? 'كلمة المرور غير متطابقة'
+                      : null,
+                  onFieldSubmitted: (_) => _submit(),
+                ),
+              ],
+              if (_error != null) ...[
+                const SizedBox(height: 12),
+                Text(
+                  _error!,
+                  style: TextStyle(color: Theme.of(context).colorScheme.error),
+                ),
+              ],
+            ],
+          ),
+        ),
+        actions: [
+          if (widget.allowCancel)
+            TextButton(
+              onPressed: _saving ? null : () => Navigator.of(context).pop(),
+              child: const Text('إلغاء'),
+            ),
           FilledButton(
-            onPressed: _submit,
-            child: const Text('متابعة'),
+            onPressed: _saving ? null : _submit,
+            child: Text(_saving ? 'جارٍ الحفظ...' : 'حفظ'),
           ),
         ],
+      ),
+    );
+  }
+}
+
+class _ManagerLoginPage extends StatefulWidget {
+  const _ManagerLoginPage({required this.onSubmit});
+
+  final Future<bool> Function(String password) onSubmit;
+
+  @override
+  State<_ManagerLoginPage> createState() => _ManagerLoginPageState();
+}
+
+class _ManagerLoginPageState extends State<_ManagerLoginPage> {
+  final _passwordController = TextEditingController();
+  bool _checking = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_passwordController.text.isEmpty) {
+      setState(() => _error = 'اكتب كلمة المرور');
+      return;
+    }
+    setState(() {
+      _checking = true;
+      _error = null;
+    });
+    final valid = await widget.onSubmit(_passwordController.text);
+    if (!mounted) return;
+    if (!valid) {
+      setState(() {
+        _checking = false;
+        _error = 'كلمة المرور غير صحيحة';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('تسجيل دخول المدير')),
+      body: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 400),
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextFormField(
+                  controller: _passwordController,
+                  autofocus: true,
+                  obscureText: true,
+                  decoration: const InputDecoration(
+                    labelText: 'كلمة المرور',
+                    prefixIcon: Icon(Icons.lock_outline),
+                  ),
+                  onFieldSubmitted: (_) => _submit(),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(
+                    _error!,
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.error,
+                    ),
+                  ),
+                ],
+                const SizedBox(height: 16),
+                SizedBox(
+                  width: double.infinity,
+                  child: FilledButton(
+                    onPressed: _checking ? null : _submit,
+                    child: Text(_checking ? 'جارٍ التحقق...' : 'دخول'),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -394,17 +964,40 @@ class _RoleSelectionPageState extends State<RoleSelectionPage> {
 }
 
 class EmployeeRecord {
-  const EmployeeRecord({required this.id, required this.name});
+  const EmployeeRecord({
+    required this.id,
+    required this.name,
+    this.passwordSalt,
+    this.passwordHash,
+  });
 
   final String id;
   final String name;
+  final String? passwordSalt;
+  final String? passwordHash;
+
+  bool get hasPassword => passwordSalt != null && passwordHash != null;
+
+  EmployeeRecord withPassword({String? salt, String? hash}) => EmployeeRecord(
+        id: id,
+        name: name,
+        passwordSalt: salt,
+        passwordHash: hash,
+      );
 
   factory EmployeeRecord.fromJson(Map<String, dynamic> json) => EmployeeRecord(
         id: json['id'] as String,
         name: json['name'] as String,
+        passwordSalt: json['passwordSalt'] as String?,
+        passwordHash: json['passwordHash'] as String?,
       );
 
-  Map<String, dynamic> toJson() => {'id': id, 'name': name};
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        if (passwordSalt != null) 'passwordSalt': passwordSalt,
+        if (passwordHash != null) 'passwordHash': passwordHash,
+      };
 }
 
 Widget _homeAppBarTitle(String? userName, {String appTitle = 'salary'}) {
@@ -482,9 +1075,7 @@ class EmployeeStore {
       final file = File('${entity.path}/employee.json');
       if (!await file.exists()) continue;
       final decoded = jsonDecode(await file.readAsString());
-      employees.add(
-        EmployeeRecord.fromJson(decoded as Map<String, dynamic>),
-      );
+      employees.add(EmployeeRecord.fromJson(decoded as Map<String, dynamic>));
     }
     employees.sort(
       (first, second) =>
@@ -506,18 +1097,62 @@ class EmployeeStore {
     final employee = EmployeeRecord(id: id, name: normalizedName);
     final directory = Directory('${root.path}/$id');
     await directory.create(recursive: true);
-    await File('${directory.path}/employee.json').writeAsString(
-      jsonEncode(employee.toJson()),
-      flush: true,
-    );
+    await File('${directory.path}/employee.json')
+        .writeAsString(jsonEncode(employee.toJson()), flush: true);
     await Directory('${directory.path}/months').create(recursive: true);
     return employee;
+  }
+
+  Future<void> setPassword(EmployeeRecord employee, String? password) async {
+    if (!RegExp(r'^[A-Za-z0-9_%\-]+$').hasMatch(employee.id)) {
+      throw ArgumentError.value(
+        employee.id,
+        'employee.id',
+        'Invalid employee ID',
+      );
+    }
+    final current = employee.hasPassword
+        ? employee
+        : EmployeeRecord(id: employee.id, name: employee.name);
+    final updated = password == null
+        ? current.withPassword()
+        : await _createPasswordCredential(password).then(
+            (credential) => current.withPassword(
+              salt: credential.salt,
+              hash: credential.hash,
+            ),
+          );
+    final root = await _employeesDirectory();
+    final file = File('${root.path}/${employee.id}/employee.json');
+    await file.writeAsString(jsonEncode(updated.toJson()), flush: true);
+  }
+
+  Future<void> deleteEmployee(EmployeeRecord employee) async {
+    if (!RegExp(r'^[A-Za-z0-9_%\-]+$').hasMatch(employee.id)) {
+      throw ArgumentError.value(
+        employee.id,
+        'employee.id',
+        'Invalid employee ID',
+      );
+    }
+    final root = await _employeesDirectory();
+    final directory = Directory('${root.path}/${employee.id}');
+    if (!await directory.exists()) {
+      throw FileSystemException(
+        'Employee directory does not exist',
+        directory.path,
+      );
+    }
+    await directory.delete(recursive: true);
   }
 
   Future<Directory> monthsDirectory(EmployeeRecord employee) async {
     if (!RegExp(r'^[A-Za-z0-9_%\-]+$').hasMatch(employee.id)) {
       throw ArgumentError.value(
-          employee.id, 'employee.id', 'Invalid employee ID');
+        employee.id,
+        'employee.id',
+        'Invalid employee ID',
+      );
     }
     final root = await _employeesDirectory();
     final directory = Directory('${root.path}/${employee.id}/months');
@@ -527,9 +1162,14 @@ class EmployeeStore {
 }
 
 class EmployeeSelectionPage extends StatefulWidget {
-  const EmployeeSelectionPage({required this.store, super.key});
+  const EmployeeSelectionPage({
+    required this.store,
+    this.attendanceModeStore,
+    super.key,
+  });
 
   final EmployeeStore store;
+  final AttendanceModeStore? attendanceModeStore;
 
   @override
   State<EmployeeSelectionPage> createState() => _EmployeeSelectionPageState();
@@ -545,6 +1185,21 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
   }
 
   Future<void> _openEmployee(EmployeeRecord employee) async {
+    if (employee.hasPassword) {
+      final unlocked = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => _EmployeePasswordDialog(
+          employeeName: employee.name,
+          onSubmit: (password) => _verifyPassword(
+            password,
+            employee.passwordSalt!,
+            employee.passwordHash!,
+          ),
+        ),
+      );
+      if (unlocked != true || !mounted) return;
+    }
     try {
       final directory = await widget.store.monthsDirectory(employee);
       if (!mounted) return;
@@ -555,6 +1210,7 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
             userName: employee.name,
             appTitle: 'تطبيق الموظفين',
             employeeMode: true,
+            attendanceModeStore: widget.attendanceModeStore,
           ),
         ),
       );
@@ -562,6 +1218,115 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('تعذر فتح سجل الموظف: ${error.message}')),
+        );
+      }
+    }
+  }
+
+  Future<void> _manageEmployeePasswords() async {
+    final employees = await _employeesFuture;
+    if (!mounted || employees.isEmpty) return;
+    final employee = await showModalBottomSheet<EmployeeRecord>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'اختار الموظف لإدارة كلمة المرور',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+            for (final employee in employees)
+              ListTile(
+                leading: Icon(
+                  employee.hasPassword
+                      ? Icons.lock_outline
+                      : Icons.lock_open_outlined,
+                ),
+                title: Text(employee.name),
+                subtitle: Text(
+                  employee.hasPassword
+                      ? 'كلمة المرور مفعّلة'
+                      : 'بدون كلمة مرور',
+                ),
+                onTap: () => Navigator.of(context).pop(employee),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (employee == null || !mounted) return;
+
+    var removePassword = false;
+    if (employee.hasPassword) {
+      final action = await showModalBottomSheet<_EmployeePasswordAction>(
+        context: context,
+        builder: (context) => SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              ListTile(
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('تعديل كلمة المرور'),
+                onTap: () =>
+                    Navigator.of(context).pop(_EmployeePasswordAction.change),
+              ),
+              ListTile(
+                leading: const Icon(Icons.lock_open_outlined),
+                title: const Text('إلغاء كلمة المرور'),
+                onTap: () =>
+                    Navigator.of(context).pop(_EmployeePasswordAction.remove),
+              ),
+            ],
+          ),
+        ),
+      );
+      if (action == null || !mounted) return;
+      removePassword = action == _EmployeePasswordAction.remove;
+    }
+
+    final result = await showDialog<_PasswordDialogResult>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => _PasswordDialog(
+        title: removePassword
+            ? 'إلغاء كلمة مرور ${employee.name}'
+            : employee.hasPassword
+                ? 'تعديل كلمة مرور ${employee.name}'
+                : 'إنشاء كلمة مرور ${employee.name}',
+        confirmPassword: !removePassword,
+        requireOldPassword: employee.hasPassword,
+        removePassword: removePassword,
+        oldPasswordSalt: employee.passwordSalt,
+        oldPasswordHash: employee.passwordHash,
+      ),
+    );
+    if (result == null || !mounted) return;
+    try {
+      await widget.store.setPassword(
+        employee,
+        result.remove ? null : result.password,
+      );
+      if (!mounted) return;
+      setState(() {
+        _employeesFuture = widget.store.loadEmployees();
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            result.remove
+                ? 'تم إلغاء كلمة مرور ${employee.name}'
+                : 'تم حفظ كلمة مرور ${employee.name}',
+          ),
+        ),
+      );
+    } on FileSystemException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر حفظ كلمة المرور: ${error.message}')),
         );
       }
     }
@@ -634,6 +1399,105 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
           );
         },
       ),
+      bottomNavigationBar: SafeArea(
+        child: Padding(
+          padding: const EdgeInsetsDirectional.fromSTEB(16, 4, 16, 8),
+          child: Align(
+            heightFactor: 1,
+            alignment: AlignmentDirectional.centerEnd,
+            child: TextButton.icon(
+              onPressed: _manageEmployeePasswords,
+              icon: const Icon(Icons.password_outlined),
+              label: const Text('تعديل الباسورد'),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+enum _EmployeePasswordAction { change, remove }
+
+class _EmployeePasswordDialog extends StatefulWidget {
+  const _EmployeePasswordDialog({
+    required this.employeeName,
+    required this.onSubmit,
+  });
+
+  final String employeeName;
+  final Future<bool> Function(String password) onSubmit;
+
+  @override
+  State<_EmployeePasswordDialog> createState() =>
+      _EmployeePasswordDialogState();
+}
+
+class _EmployeePasswordDialogState extends State<_EmployeePasswordDialog> {
+  final _passwordController = TextEditingController();
+  String? _error;
+  bool _checking = false;
+
+  @override
+  void dispose() {
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    if (_passwordController.text.isEmpty) {
+      setState(() => _error = 'اكتب كلمة المرور');
+      return;
+    }
+    setState(() {
+      _checking = true;
+      _error = null;
+    });
+    final valid = await widget.onSubmit(_passwordController.text);
+    if (!mounted) return;
+    if (valid) {
+      Navigator.of(context).pop(true);
+    } else {
+      setState(() {
+        _checking = false;
+        _error = 'كلمة المرور غير صحيحة';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('كلمة مرور ${widget.employeeName}'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          TextField(
+            controller: _passwordController,
+            autofocus: true,
+            obscureText: true,
+            decoration: const InputDecoration(labelText: 'كلمة المرور'),
+            onSubmitted: (_) => _submit(),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 12),
+            Text(
+              _error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _checking ? null : () => Navigator.of(context).pop(false),
+          child: const Text('إلغاء'),
+        ),
+        FilledButton(
+          onPressed: _checking ? null : _submit,
+          child: Text(_checking ? 'جارٍ التحقق...' : 'فتح'),
+        ),
+      ],
     );
   }
 }
@@ -644,11 +1508,15 @@ class EmployeesPage extends StatefulWidget {
     this.store,
     this.userName,
     this.appTitle = 'salary',
+    this.onChangePassword,
+    this.attendanceModeStore,
   });
 
   final EmployeeStore? store;
   final String? userName;
   final String appTitle;
+  final Future<void> Function()? onChangePassword;
+  final AttendanceModeStore? attendanceModeStore;
 
   @override
   State<EmployeesPage> createState() => _EmployeesPageState();
@@ -697,10 +1565,7 @@ class _EmployeeNameDialogState extends State<_EmployeeNameDialog> {
           onPressed: () => Navigator.of(context).pop(),
           child: const Text('إلغاء'),
         ),
-        FilledButton(
-          onPressed: _submit,
-          child: const Text('إضافة'),
-        ),
+        FilledButton(onPressed: _submit, child: const Text('إضافة')),
       ],
     );
   }
@@ -708,12 +1573,14 @@ class _EmployeeNameDialogState extends State<_EmployeeNameDialog> {
 
 class _EmployeesPageState extends State<EmployeesPage> {
   late final EmployeeStore _employeeStore;
+  late final AttendanceModeStore _attendanceModeStore;
   late Future<List<EmployeeRecord>> _employeesFuture;
 
   @override
   void initState() {
     super.initState();
     _employeeStore = widget.store ?? EmployeeStore();
+    _attendanceModeStore = widget.attendanceModeStore ?? AttendanceModeStore();
     _employeesFuture = _employeeStore.loadEmployees();
   }
 
@@ -732,6 +1599,157 @@ class _EmployeesPageState extends State<EmployeesPage> {
       });
     } on FileSystemException catch (error) {
       if (mounted) _showMessage('تعذر إضافة الموظف: ${error.message}');
+    }
+  }
+
+  Future<void> _deleteEmployee() async {
+    final employees = await _employeesFuture;
+    if (!mounted) return;
+    if (employees.isEmpty) {
+      _showMessage('مفيش موظفين لحذفهم');
+      return;
+    }
+
+    final employee = await showModalBottomSheet<EmployeeRecord>(
+      context: context,
+      builder: (context) => SafeArea(
+        child: ListView(
+          shrinkWrap: true,
+          children: [
+            const Padding(
+              padding: EdgeInsets.all(16),
+              child: Text(
+                'اختار الموظف المراد حذفه',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              ),
+            ),
+            for (final employee in employees)
+              ListTile(
+                leading: const Icon(Icons.person_remove_outlined),
+                title: Text(employee.name),
+                onTap: () => Navigator.of(context).pop(employee),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (employee == null || !mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('حذف الموظف؟'),
+        content: Text(
+          'سيتم حذف ${employee.name} وكل الشهور وسجلات الحضور والرواتب الخاصة به نهائيًا.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('حذف نهائيًا'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    try {
+      await _employeeStore.deleteEmployee(employee);
+      if (!mounted) return;
+      setState(() {
+        _employeesFuture = _employeeStore.loadEmployees();
+      });
+      _showMessage('تم حذف الموظف وكل بياناته');
+    } on FileSystemException catch (error) {
+      if (mounted) _showMessage('تعذر حذف الموظف: ${error.message}');
+    }
+  }
+
+  Future<void> _manageAttendanceMode() async {
+    final AttendanceMode currentMode;
+    try {
+      currentMode = await _attendanceModeStore.load();
+    } on FileSystemException catch (error) {
+      if (mounted) _showMessage('تعذر تحميل نظام الحضور: ${error.message}');
+      return;
+    } on FormatException {
+      if (mounted) _showMessage('إعداد نظام الحضور غير صالح');
+      return;
+    }
+    if (!mounted) return;
+
+    final selectedMode = await showDialog<AttendanceMode>(
+      context: context,
+      builder: (context) {
+        var selected = currentMode;
+        return StatefulBuilder(
+          builder: (context, setDialogState) => AlertDialog(
+            title: const Text('نظام الحضور والانصراف'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ListTile(
+                  leading: Icon(
+                    selected == AttendanceMode.optional
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                  ),
+                  title: const Text('نظام اختياري'),
+                  subtitle: const Text('اختيار وقت الحضور والانصراف يدويًا'),
+                  onTap: () => setDialogState(
+                    () => selected = AttendanceMode.optional,
+                  ),
+                ),
+                ListTile(
+                  leading: Icon(
+                    selected == AttendanceMode.mandatory
+                        ? Icons.radio_button_checked
+                        : Icons.radio_button_unchecked,
+                  ),
+                  title: const Text('نظام إجباري'),
+                  subtitle: const Text(
+                    'تسجيل الوقت تلقائيًا لليوم الحالي ومنع تعديله',
+                  ),
+                  onTap: () => setDialogState(
+                    () => selected = AttendanceMode.mandatory,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                const Text(
+                  'يُطبّق على جميع الموظفين ولا يغيّر السجلات الموجودة.',
+                ),
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(),
+                child: const Text('إلغاء'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.of(context).pop(selected),
+                child: const Text('حفظ النظام'),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+    if (selectedMode == null || !mounted) return;
+
+    try {
+      await _attendanceModeStore.save(selectedMode);
+      if (mounted) {
+        _showMessage(
+          selectedMode == AttendanceMode.optional
+              ? 'تم تفعيل نظام الحضور الاختياري'
+              : 'تم تفعيل نظام الحضور الإجباري',
+        );
+      }
+    } on FileSystemException catch (error) {
+      if (mounted) _showMessage('تعذر حفظ نظام الحضور: ${error.message}');
     }
   }
 
@@ -754,9 +1772,8 @@ class _EmployeesPageState extends State<EmployeesPage> {
   }
 
   void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -764,6 +1781,13 @@ class _EmployeesPageState extends State<EmployeesPage> {
     return Scaffold(
       appBar: AppBar(
         title: _homeAppBarTitle(widget.userName, appTitle: widget.appTitle),
+        actions: [
+          TextButton.icon(
+            onPressed: _manageAttendanceMode,
+            icon: const Icon(Icons.fact_check_outlined),
+            label: const Text('نظام الحضور والانصراف'),
+          ),
+        ],
       ),
       floatingActionButton: Row(
         mainAxisSize: MainAxisSize.min,
@@ -773,6 +1797,13 @@ class _EmployeesPageState extends State<EmployeesPage> {
             onPressed: _addEmployee,
             icon: const Icon(Icons.person_add_alt_1),
             label: const Text('إضافة موظف'),
+          ),
+          const SizedBox(width: 8),
+          FloatingActionButton.extended(
+            heroTag: 'delete-employee',
+            onPressed: _deleteEmployee,
+            icon: const Icon(Icons.person_remove_outlined),
+            label: const Text('حذف موظف'),
           ),
           const SizedBox(width: 8),
           FloatingActionButton.small(
@@ -833,6 +1864,22 @@ class _EmployeesPageState extends State<EmployeesPage> {
           );
         },
       ),
+      bottomNavigationBar: widget.onChangePassword == null
+          ? null
+          : SafeArea(
+              child: Padding(
+                padding: const EdgeInsetsDirectional.fromSTEB(16, 4, 16, 8),
+                child: Align(
+                  heightFactor: 1,
+                  alignment: AlignmentDirectional.centerEnd,
+                  child: TextButton.icon(
+                    onPressed: widget.onChangePassword,
+                    icon: const Icon(Icons.password_outlined),
+                    label: const Text('تعديل الباسورد'),
+                  ),
+                ),
+              ),
+            ),
     );
   }
 }
@@ -937,9 +1984,8 @@ Future<void> _openWhatsApp(BuildContext context) async {
     mode: LaunchMode.externalApplication,
   );
   if (!opened && context.mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('تعذر فتح واتساب')),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(const SnackBar(content: Text('تعذر فتح واتساب')));
   }
 }
 
@@ -977,15 +2023,18 @@ class MonthRecord {
 
   int get leaveDays {
     final daysInMonth = DateTime(year, month + 1, 0).day;
-    return List.generate(daysInMonth, (index) => index + 1)
-        .where((dayNumber) => !dayRecord(dayNumber).isWorking)
-        .length;
+    return List.generate(
+      daysInMonth,
+      (index) => index + 1,
+    ).where((dayNumber) => !dayRecord(dayNumber).isWorking).length;
   }
 
   double get totalHours {
     final daysInMonth = DateTime(year, month + 1, 0).day;
-    return List.generate(daysInMonth, (index) => index + 1)
-        .fold(0, (sum, dayNumber) => sum + dayRecord(dayNumber).hours);
+    return List.generate(
+      daysInMonth,
+      (index) => index + 1,
+    ).fold(0, (sum, dayNumber) => sum + dayRecord(dayNumber).hours);
   }
 
   factory MonthRecord.fromJson(Map<String, dynamic> json) {
@@ -1023,21 +2072,13 @@ class MonthRecord {
 }
 
 class DayRecord {
-  const DayRecord({
-    this.arrival,
-    this.departure,
-    this.isWorking = true,
-  });
+  const DayRecord({this.arrival, this.departure, this.isWorking = true});
 
   final String? arrival;
   final String? departure;
   final bool isWorking;
 
-  DayRecord copyWith({
-    String? arrival,
-    String? departure,
-    bool? isWorking,
-  }) =>
+  DayRecord copyWith({String? arrival, String? departure, bool? isWorking}) =>
       DayRecord(
         arrival: arrival ?? this.arrival,
         departure: departure ?? this.departure,
@@ -1107,10 +2148,8 @@ class MonthStore {
       final root = await _monthsDirectory();
       final directory = Directory('${root.path}/${record.id}');
       await directory.create(recursive: true);
-      await File('${directory.path}/data.json').writeAsString(
-        jsonEncode(record.toJson()),
-        flush: true,
-      );
+      await File('${directory.path}/data.json')
+          .writeAsString(jsonEncode(record.toJson()), flush: true);
     });
     _saveQueue = write.catchError((Object _) {});
     return write;
@@ -1138,6 +2177,7 @@ class MonthsPage extends StatefulWidget {
     this.userName,
     this.appTitle = 'salary',
     this.employeeMode = false,
+    this.attendanceModeStore,
     super.key,
   });
 
@@ -1145,6 +2185,7 @@ class MonthsPage extends StatefulWidget {
   final String? userName;
   final String appTitle;
   final bool employeeMode;
+  final AttendanceModeStore? attendanceModeStore;
 
   @override
   State<MonthsPage> createState() => _MonthsPageState();
@@ -1214,8 +2255,10 @@ class _MonthsPageState extends State<MonthsPage> {
               ListTile(
                 leading: const Icon(Icons.folder_outlined),
                 title: Text(
-                  DateFormat('MMMM yyyy', 'ar')
-                      .format(DateTime(month.year, month.month)),
+                  DateFormat(
+                    'MMMM yyyy',
+                    'ar',
+                  ).format(DateTime(month.year, month.month)),
                 ),
                 onTap: () => Navigator.of(context).pop(month),
               ),
@@ -1259,9 +2302,8 @@ class _MonthsPageState extends State<MonthsPage> {
   }
 
   void _showMessage(String message) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -1338,21 +2380,46 @@ class _MonthsPageState extends State<MonthsPage> {
                     child: Icon(Icons.folder_outlined),
                   ),
                   title: Text(
-                    DateFormat('MMMM yyyy', 'ar').format(
-                      DateTime(month.year, month.month),
-                    ),
+                    DateFormat(
+                      'MMMM yyyy',
+                      'ar',
+                    ).format(DateTime(month.year, month.month)),
                   ),
                   subtitle: Text(
                     'إجمالي الساعات: ${_formatNumber(_monthHours(month))}',
                   ),
                   trailing: const Icon(Icons.chevron_left),
                   onTap: () async {
-                    await Navigator.of(context).push(
+                    final navigator = Navigator.of(context);
+                    var attendanceMode = AttendanceMode.optional;
+                    if (widget.employeeMode &&
+                        widget.attendanceModeStore != null) {
+                      try {
+                        attendanceMode =
+                            await widget.attendanceModeStore!.load();
+                      } on FileSystemException catch (error) {
+                        if (mounted) {
+                          _showMessage(
+                            'تعذر تحميل نظام الحضور: ${error.message}',
+                          );
+                        }
+                        return;
+                      } on FormatException {
+                        if (mounted) {
+                          _showMessage('إعداد نظام الحضور غير صالح');
+                        }
+                        return;
+                      }
+                    }
+                    if (!mounted) return;
+                    await navigator.push(
                       MaterialPageRoute<void>(
                         builder: (_) => MonthPage(
                           month: month,
                           store: _store,
                           employeeMode: widget.employeeMode,
+                          attendanceMode: attendanceMode,
+                          attendanceModeStore: widget.attendanceModeStore,
                         ),
                       ),
                     );
@@ -1382,12 +2449,16 @@ class MonthPage extends StatefulWidget {
     required this.month,
     required this.store,
     this.employeeMode = false,
+    this.attendanceMode = AttendanceMode.optional,
+    this.attendanceModeStore,
     super.key,
   });
 
   final MonthRecord month;
   final MonthStore store;
   final bool employeeMode;
+  final AttendanceMode attendanceMode;
+  final AttendanceModeStore? attendanceModeStore;
 
   @override
   State<MonthPage> createState() => _MonthPageState();
@@ -1397,11 +2468,13 @@ class _MonthPageState extends State<MonthPage> {
   late final TextEditingController _rateController;
   late final TextEditingController _vacationDaysController;
   late final TextEditingController _workDaysController;
+  late AttendanceMode _attendanceMode;
   bool _saving = false;
 
   @override
   void initState() {
     super.initState();
+    _attendanceMode = widget.attendanceMode;
     _rateController = TextEditingController(
       text: widget.month.hourlyRate?.toString() ?? '',
     );
@@ -1453,6 +2526,10 @@ class _MonthPageState extends State<MonthPage> {
   }
 
   Future<void> _chooseTime(int dayNumber, bool isArrival) async {
+    if (widget.employeeMode && widget.attendanceModeStore != null) {
+      final mode = await _syncAttendanceMode();
+      if (!mounted || mode != AttendanceMode.optional) return;
+    }
     final record = widget.month.dayRecord(dayNumber);
     final current = isArrival ? record.arrival : record.departure;
     final initialTime = current == null
@@ -1473,6 +2550,60 @@ class _MonthPageState extends State<MonthPage> {
       await _updateDay(dayNumber, arrival: value);
     } else {
       await _updateDay(dayNumber, departure: value);
+    }
+  }
+
+  Future<void> _recordAttendance(int dayNumber, bool isArrival) async {
+    final mode = widget.attendanceModeStore == null
+        ? _attendanceMode
+        : await _syncAttendanceMode();
+    if (!mounted || mode != AttendanceMode.mandatory) return;
+    final now = DateTime.now();
+    final date = DateTime(widget.month.year, widget.month.month, dayNumber);
+    if (date.year != now.year ||
+        date.month != now.month ||
+        date.day != now.day) {
+      return;
+    }
+    final previous = widget.month.days[dayNumber] ?? const DayRecord();
+    if (!previous.isWorking ||
+        (isArrival ? previous.arrival : previous.departure) != null ||
+        _saving) {
+      return;
+    }
+    final value =
+        '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+    if (isArrival) {
+      await _updateDay(dayNumber, arrival: value);
+    } else {
+      await _updateDay(dayNumber, departure: value);
+    }
+  }
+
+  Future<AttendanceMode?> _syncAttendanceMode() async {
+    final store = widget.attendanceModeStore;
+    if (store == null) return _attendanceMode;
+    try {
+      final mode = await store.load();
+      if (!mounted) return null;
+      if (_attendanceMode != mode) {
+        setState(() => _attendanceMode = mode);
+      }
+      return mode;
+    } on FileSystemException catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر تحميل نظام الحضور: ${error.message}')),
+        );
+      }
+      return null;
+    } on FormatException {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('إعداد نظام الحضور غير صالح')),
+        );
+      }
+      return null;
     }
   }
 
@@ -1544,7 +2675,21 @@ class _MonthPageState extends State<MonthPage> {
   Widget build(BuildContext context) {
     final month = widget.month;
     final daysInMonth = DateTime(month.year, month.month + 1, 0).day;
-    final hours = _monthHours(month);
+    final now = DateTime.now();
+    final isMandatoryEmployeeMode =
+        widget.employeeMode && _attendanceMode == AttendanceMode.mandatory;
+    var hours = _monthHours(month);
+    if (isMandatoryEmployeeMode &&
+        month.year == now.year &&
+        month.month == now.month) {
+      final savedToday = month.days[now.day] ?? const DayRecord();
+      final storedHours = DayRecord(
+        arrival: savedToday.arrival,
+        departure: savedToday.departure,
+        isWorking: savedToday.isWorking,
+      ).hours;
+      hours += storedHours - month.dayRecord(now.day).hours;
+    }
     final netWorkDays = month.workDays - month.vacationDays;
     final salary =
         netWorkDays > 0 ? hours / netWorkDays * (month.hourlyRate ?? 0) : 0;
@@ -1552,8 +2697,10 @@ class _MonthPageState extends State<MonthPage> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          DateFormat('MMMM yyyy', 'ar')
-              .format(DateTime(month.year, month.month)),
+          DateFormat(
+            'MMMM yyyy',
+            'ar',
+          ).format(DateTime(month.year, month.month)),
         ),
         actions: [
           if (_saving)
@@ -1626,7 +2773,17 @@ class _MonthPageState extends State<MonthPage> {
                 }
                 final dayNumber = index;
                 final date = DateTime(month.year, month.month, dayNumber);
-                final record = month.dayRecord(dayNumber);
+                final isToday = date.year == now.year &&
+                    date.month == now.month &&
+                    date.day == now.day;
+                final savedRecord = month.days[dayNumber] ?? const DayRecord();
+                final record = isMandatoryEmployeeMode && isToday
+                    ? DayRecord(
+                        arrival: savedRecord.arrival,
+                        departure: savedRecord.departure,
+                        isWorking: savedRecord.isWorking,
+                      )
+                    : month.dayRecord(dayNumber);
                 return Card(
                   margin: const EdgeInsets.only(bottom: 8),
                   child: Padding(
@@ -1662,25 +2819,69 @@ class _MonthPageState extends State<MonthPage> {
                               ),
                             ),
                             const SizedBox(width: 4),
-                            Expanded(
-                              child: _TimeEntry(
-                                title: 'الحضور',
-                                value: record.arrival,
-                                onTap: record.isWorking
-                                    ? () => _chooseTime(dayNumber, true)
-                                    : null,
+                            if (isMandatoryEmployeeMode && isToday) ...[
+                              Expanded(
+                                child: _AttendancePunchButton(
+                                  title: 'حضور',
+                                  time: savedRecord.arrival,
+                                  enabled: isToday &&
+                                      record.isWorking &&
+                                      savedRecord.arrival == null &&
+                                      !_saving,
+                                  onPressed: () =>
+                                      _recordAttendance(dayNumber, true),
+                                ),
                               ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: _TimeEntry(
-                                title: 'الانصراف',
-                                value: record.departure,
-                                onTap: record.isWorking
-                                    ? () => _chooseTime(dayNumber, false)
-                                    : null,
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: _AttendancePunchButton(
+                                  title: 'انصراف',
+                                  time: savedRecord.departure,
+                                  enabled: isToday &&
+                                      record.isWorking &&
+                                      savedRecord.departure == null &&
+                                      !_saving,
+                                  onPressed: () =>
+                                      _recordAttendance(dayNumber, false),
+                                ),
                               ),
-                            ),
+                            ] else if (isMandatoryEmployeeMode) ...[
+                              Expanded(
+                                child: _TimeEntry(
+                                  title: 'الحضور',
+                                  value: record.arrival,
+                                  onTap: null,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: _TimeEntry(
+                                  title: 'الانصراف',
+                                  value: record.departure,
+                                  onTap: null,
+                                ),
+                              ),
+                            ] else ...[
+                              Expanded(
+                                child: _TimeEntry(
+                                  title: 'الحضور',
+                                  value: record.arrival,
+                                  onTap: record.isWorking
+                                      ? () => _chooseTime(dayNumber, true)
+                                      : null,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: _TimeEntry(
+                                  title: 'الانصراف',
+                                  value: record.departure,
+                                  onTap: record.isWorking
+                                      ? () => _chooseTime(dayNumber, false)
+                                      : null,
+                                ),
+                              ),
+                            ],
                             const SizedBox(width: 8),
                             SizedBox(
                               width: 58,
@@ -1831,6 +3032,41 @@ class _MonthPageState extends State<MonthPage> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AttendancePunchButton extends StatelessWidget {
+  const _AttendancePunchButton({
+    required this.title,
+    required this.time,
+    required this.enabled,
+    required this.onPressed,
+  });
+
+  final String title;
+  final String? time;
+  final bool enabled;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: double.infinity,
+          child: FilledButton.tonalIcon(
+            onPressed: enabled ? onPressed : null,
+            icon: Icon(title == 'حضور' ? Icons.login : Icons.logout, size: 18),
+            label: Text(title),
+            style: FilledButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+            ),
+          ),
+        ),
+        Text(time ?? '--:--'),
+      ],
     );
   }
 }

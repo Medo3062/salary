@@ -3,10 +3,26 @@ import 'dart:io';
 import 'package:employee_salary/main.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:intl/date_symbol_data_local.dart';
+import 'package:intl/intl.dart';
 
 class _EmptyMonthStore extends MonthStore {
   @override
   Future<List<MonthRecord>> loadMonths() async => [];
+}
+
+class _CurrentMonthStore extends MonthStore {
+  _CurrentMonthStore(this.month);
+
+  final MonthRecord month;
+
+  @override
+  Future<List<MonthRecord>> loadMonths() async => [month];
+}
+
+class _MandatoryAttendanceModeStore extends AttendanceModeStore {
+  @override
+  Future<AttendanceMode> load() async => AttendanceMode.mandatory;
 }
 
 void main() {
@@ -54,5 +70,34 @@ void main() {
     expect(find.text('إضافة شهر'), findsOneWidget);
     expect(find.text('حذف شهر'), findsNothing);
     expect(find.byIcon(Icons.delete_outline), findsNothing);
+  });
+
+  testWidgets('employee month list applies the manager-selected mandatory mode',
+      (tester) async {
+    await initializeDateFormatting('ar');
+    final now = DateTime.now();
+    final month = MonthRecord(year: now.year, month: now.month);
+    await tester.pumpWidget(
+      MaterialApp(
+        home: MonthsPage(
+          store: _CurrentMonthStore(month),
+          employeeMode: true,
+          attendanceModeStore: _MandatoryAttendanceModeStore(),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(
+      find.text(DateFormat('MMMM yyyy', 'ar').format(now)),
+    );
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.textContaining(DateFormat('d/M/yyyy', 'ar').format(now)),
+      300,
+    );
+
+    expect(find.text('حضور'), findsOneWidget);
+    expect(find.text('انصراف'), findsOneWidget);
   });
 }
