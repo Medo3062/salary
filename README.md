@@ -1,68 +1,120 @@
 # salary
 
-تطبيق Flutter لتسجيل حضور وانصراف الموظف وحساب ساعات العمل والمرتب الشهري، مع نسختين منفصلتين للكمبيوتر: تطبيق المدير وتطبيق الموظفين.
+تطبيق Flutter لإدارة الموظفين والحضور والانصراف والرواتب. يحتفظ المشروع بالواجهات العربية الحالية، ويحوّل بيانات المؤسسات والموظفين والحضور إلى Supabase حتى يشاركها تطبيق المدير والهاتف وتطبيق الموظفين على Windows.
 
-## تشغيل التطبيق على Android
+## التطبيقات والمنصات
 
-1. ثبّت Flutter وAndroid SDK.
-2. من مجلد المشروع أنشئ ملفات منصة Android إذا لم تكن موجودة:
-   `flutter create --platforms=android --project-name employee_salary .`
-3. شغّل `flutter pub get` ثم `flutter run`.
+- **تطبيق المدير:** Android وiOS. يسجل المدير الدخول ببيانات المدير الخاصة بالمؤسسة، ثم يضيف الموظفين ويدير شهورهم وساعاتهم ورواتبهم.
+- **تطبيق الموظفين:** Windows. يسجل حساب الموظفين الخاص بالمؤسسة مرة واحدة لربط هذا الجهاز بها؛ بعد ذلك يختار الموظف اسمه ويسجل الحضور والانصراف.
+- **تطبيق سوبر أدمن:** Fedora/Linux. يسجل سوبر أدمن الدخول، وينشئ المؤسسات وبيانات دخول منفصلة للمدير والموظفين، ويوقف المؤسسة أو يفعّلها ويغير بياناتها.
 
-## التشغيل والتجربة على Fedora/Linux
+يعرض سوبر أدمن بيانات دخول المؤسسة. كلمات المرور مشفّرة في قاعدة البيانات بمفتاح محفوظ في Supabase Vault، كما يُحفظ hash للتحقق من تسجيل الدخول. لا تضع مفتاح التشفير في التطبيق أو المستودع، ولا تحذفه أو تدوّره دون إعادة تشفير كلمات المرور. تحفظ الجلسة في التخزين الآمن على الجهاز، ويجدد التطبيق قفل الجهاز كل دقيقة. تنتهي الجلسة تلقائيًا بعد 10 دقائق من انقطاع الاتصال، أو مباشرة عند تسجيل الخروج بنجاح.
 
-ثبّت متطلبات Flutter لتطوير Linux desktop:
+## إعداد قاعدة البيانات السحابية
+
+1. أنشئ مشروع Supabase.
+2. نفّذ ملف `supabase/migrations/20261011000000_initial_tenant_backend.sql` في SQL Editor. ينشئ المؤسسات والمستخدمين وسجلات الحضور والجلسات ووظائف API؛ بيانات كل مؤسسة معزولة في الخادم.
+3. أنشئ مفتاح تشفير عشوائيًا في Supabase Vault من SQL Editor. لا تنسخ المفتاح إلى ملفات المشروع أو التطبيق:
+
+   ```sql
+   select vault.create_secret(
+     encode(extensions.gen_random_bytes(32), 'base64'),
+     'company-password-encryption-key',
+     'Key used to encrypt company login passwords'
+   );
+   ```
+
+   احتفظ بنسخة احتياطية آمنة من المفتاح؛ من دونه لن يمكن فك تشفير كلمات مرور المؤسسات.
+4. أنشئ حساب سوبر أدمن مرة واحدة من SQL Editor باستخدام اسم المستخدم `Mohamed306` وكلمة المرور التي حددتها، وخزّن كلمة المرور كـ bcrypt hash. لا تضف كلمة المرور إلى ملفات المشروع أو المستودع:
+
+   ```sql
+   insert into public.superadmin_accounts(username, password_hash)
+   values ('Mohamed306', extensions.crypt('<أدخل كلمة المرور يدويًا هنا>', extensions.gen_salt('bf')))
+   on conflict (username) do update
+   set password_hash = excluded.password_hash;
+   ```
+
+   استبدل النص بين علامتي الزاوية بكلمة المرور في لوحة Supabase فقط، ولا تحفظ الاستعلام أو تشاركه.
+5. استخدم **Project URL** ومعه **Publishable key** أو مفتاح **Legacy `anon`** العام من إعدادات Supabase عند تشغيل التطبيق أو بنائه. لا تضع مفتاح `service_role` أو secret key في تطبيق Flutter.
+
+## التشغيل والبناء
+
+مرّر الإعدادات من البيئة عند البناء، ولا تكتبها في ملفات Dart:
 
 ```bash
-sudo dnf install clang cmake ninja-build pkgconf-pkg-config gtk3-devel gcc-c++
+flutter pub get
+flutter run -d linux \
+  --dart-define=APP_ROLE=superadmin \
+  --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+  --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
 ```
 
-اعرض الأجهزة المتاحة بـ `flutter devices` ثم شغّل كل تطبيق من مجلد المشروع في Terminal مستقل:
+### سوبر أدمن على Fedora/Linux
+
+ثبّت متطلبات Flutter والتخزين الآمن على Fedora:
 
 ```bash
-flutter run -d linux --dart-define=APP_ROLE=manager
-flutter run -d linux --dart-define=APP_ROLE=employee
+sudo dnf install clang cmake ninja-build pkgconf-pkg-config gtk3-devel gcc-c++ libsecret-devel
 ```
 
-ابنِ نسختي Linux القابلتين للتشغيل على Fedora بالأوامر التالية:
+ثم ابنِ التطبيق:
 
 ```bash
-flutter build linux --release --dart-define=APP_ROLE=manager
-mkdir -p dist/manager-linux
-cp -a build/linux/x64/release/bundle/. dist/manager-linux/
-mv dist/manager-linux/employee_salary dist/manager-linux/manager-app
-flutter build linux --release --dart-define=APP_ROLE=employee
-mkdir -p dist/employee-linux
-cp -a build/linux/x64/release/bundle/. dist/employee-linux/
-mv dist/employee-linux/employee_salary dist/employee-linux/employee-app
+flutter build linux --release \
+  --dart-define=APP_ROLE=superadmin \
+  --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+  --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
 ```
 
-## بناء تطبيقات Windows
+الملفات في `build/linux/x64/release/bundle/`.
 
-يجب تنفيذ بناء Windows على Windows؛ Flutter لا يدعم إنتاج نسخة Windows من Fedora مباشرة. يمكنك بناء النسختين محليًا على Windows بعد تثبيت Flutter وVisual Studio مع workload «Desktop development with C++»:
+### تطبيق الموظفين على Windows
 
-1. من مجلد المشروع شغّل:
-   `powershell -ExecutionPolicy Bypass -File .\tool\build_windows_apps.ps1`
-2. ستجد نسختين جاهزتين للتشغيل في `dist\employee\employee-app.exe` و`dist\manager\manager-app.exe`.
-3. شغّل التطبيقين على Windows. على أول تشغيل لتطبيق المدير، سجّل اسم المدير ثم أضف الموظفين. يفتح تطبيق الموظفين قائمة الموظفين التي جهزها المدير، ويعرض لكل موظف سجل الحضور والراتب نفسه.
+ابنِه على Windows بعد تثبيت Flutter وVisual Studio مع workload **Desktop development with C++**:
 
-### البناء تلقائيًا على GitHub
+```powershell
+$env:SUPABASE_URL = "https://YOUR_PROJECT.supabase.co"
+$env:SUPABASE_ANON_KEY = "YOUR_PUBLIC_ANON_KEY"
+powershell -ExecutionPolicy Bypass -File .\tool\build_windows_apps.ps1
+```
 
-بعد رفع المشروع إلى GitHub، سيعمل workflow تلقائيًا مع كل `push`، ويمكن تشغيله يدويًا من تبويب **Actions** عبر **Build Windows apps** ثم **Run workflow**. عند نجاح البناء، نزّل `employee-app-windows` و`manager-app-windows` من قسم **Artifacts** في صفحة تشغيل الـ workflow؛ يحتوي كل ملف مضغوط على التطبيق التنفيذي وملفات التشغيل اللازمة له. تُحذف هذه الملفات بعد 90 يومًا.
+يكون التطبيق التنفيذي في `dist\employee\employee-app.exe`.
 
-يحفظ التطبيقان بياناتهما محليًا في مجلد `salary_shared_data` داخل مجلد Documents الخاص بمستخدم Windows الحالي؛ لذلك تظهر التغييرات بين التطبيقين على الجهاز وحساب Windows نفسيهما، ولا يحتاجان إلى خادم أو اتصال إنترنت لمشاركة البيانات. بيانات Android تظل في مساحة التطبيق المعتادة.
+للبناء عبر GitHub Actions، أضف `SUPABASE_URL` وواحدًا من `SUPABASE_PUBLISHABLE_KEY` أو `SUPABASE_ANON_KEY` كمتغيري مستودع.
 
-## الاستخدام
+### تطبيق المدير على Android وiOS
 
-- في نسخة Android، عند أول تشغيل اختر «استخدام موظف» أو «استخدام مدير». اختيار الدور محفوظ ولا يظهر مجددًا.
-- في نسخة الكمبيوتر للموظفين، اختر اسمك من قائمة الموظفين التي جهزها المدير.
-- في نسخة الكمبيوتر للمدير، سجّل اسم المدير ثم أضف الموظفين وافتح سجلاتهم.
-- في سجل الموظف، يمكن للموظف تسجيل الحضور والانصراف وتحديد يوم الإجازة ومراجعة إجمالي ساعات الشهر وأيام إجازته؛ تفاصيل سعر الساعة وأيام العمل والراتب متاحة في تطبيق المدير فقط.
-- في وضع المدير، اضغط «إضافة موظف» واكتب الاسم، ثم افتح الموظف لإدارة شهوره وحضوره ومرتبه.
-- اضغط «إضافة شهر» واختر تاريخًا داخل الشهر المطلوب.
-- افتح الشهر، ويمكنك ضبط وقت حضور وانصراف افتراضيين للشهر كله؛ أي يوم يمكن تعديل وقته يدويًا بشكل مستقل.
-- استخدم «حذف شهر» لاختيار شهر وحذفه بعد تأكيد العملية.
-- اضغط زر «الإنفو» للاطلاع على معلومات التطبيق والمطور وبدء محادثة واتساب.
-- ساعات اليوم وإجمالي ساعات الشهر والمرتب تُحسب تلقائيًا.
-- أدخل سعر الساعة وأيام الإجازة وأيام العمل؛ المرتب يساوي (إجمالي الساعات ÷ (أيام العمل - أيام الإجازة)) × سعر الساعة.
-- تُحفظ بيانات كل شهر محليًا في مجلد مستقل. في Windows، يستخدم التطبيقان مجلد البيانات المشترك نفسه.
+Android APK:
+
+```bash
+flutter build apk --release \
+  --dart-define=APP_ROLE=manager \
+  --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+  --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+```
+
+iOS يتطلب جهاز macOS وXcode:
+
+```bash
+flutter build ios --release \
+  --dart-define=APP_ROLE=manager \
+  --dart-define=SUPABASE_URL="$SUPABASE_URL" \
+  --dart-define=SUPABASE_ANON_KEY="$SUPABASE_ANON_KEY"
+```
+
+## تفاصيل الاستخدام
+
+- عند أول تشغيل لتطبيق المدير أو الموظفين، أدخل اسم المستخدم وكلمة المرور المناسبة للمؤسسة. الربط يبقى محفوظًا إلى أن تسجل الخروج أو تحذف التطبيق.
+- لكل مؤسسة حساب موظفين واحد يربط نسخة Windows، وحساب مدير منفصل يربط نسخة المدير. يمنع الخادم وجود جلستين نشطتين للحساب نفسه.
+- عند تسجيل الخروج بنجاح يتحرر الحساب فورًا. عند إغلاق التطبيق أو فقد الاتصال، تنتهي الجلسة بعد 10 دقائق دون تجديد heartbeat.
+- من سوبر أدمن أضف اسم المؤسسة وبيانات الموظفين وبيانات المدير. تعرض بطاقة المؤسسة بيانات الدخول وحالتها؛ عند تسجيل الدخول يتحقق الخادم من bcrypt hash، وتُفك كلمة المرور المعروضة باستخدام مفتاح Vault.
+- يمكن للمدير إضافة الموظفين وإدارة شهورهم وسعر الساعة وأيام العمل والإجازة والحضور والانصراف. يستطيع الموظف تعديل الحضور فقط، ولا ترسل قاعدة البيانات تفاصيل الراتب إليه.
+- الراتب يُحسب وفق المعادلة الموجودة في التطبيق: (إجمالي الساعات ÷ (أيام العمل - أيام الإجازة)) × سعر الساعة.
+- وضع `APP_ROLE=combined` يبقي وضع التطوير المحلي القديم متاحًا للاختبارات اليدوية؛ لا تستخدمه لتوزيع النسخ.
+
+## الاختبارات
+
+```bash
+flutter test test/day_record_test.dart test/employee_add_test.dart test/months_page_test.dart
+flutter analyze
+```

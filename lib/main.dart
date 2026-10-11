@@ -1,8 +1,10 @@
 import 'dart:convert';
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_localizations/flutter_localizations.dart';
+import 'package:employee_salary/cloud_backend.dart';
 import 'package:intl/date_symbol_data_local.dart';
 import 'package:intl/intl.dart';
 import 'package:path_provider/path_provider.dart';
@@ -15,13 +17,17 @@ const _buildRole = String.fromEnvironment('APP_ROLE', defaultValue: 'combined');
 AppRole? get _fixedRole => switch (_buildRole) {
       'employee' => AppRole.employee,
       'manager' => AppRole.manager,
+      'superadmin' => AppRole.superadmin,
       'combined' => null,
-      _ => throw StateError('APP_ROLE must be employee, manager, or combined'),
+      _ => throw StateError(
+          'APP_ROLE must be employee, manager, superadmin, or combined',
+        ),
     };
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeDateFormatting('ar');
+  await CloudBackend.initialize();
   runApp(SalaryApp(fixedRole: _fixedRole));
 }
 
@@ -36,6 +42,7 @@ class SalaryApp extends StatelessWidget {
       title: switch (fixedRole) {
         AppRole.employee => 'salary - الموظف',
         AppRole.manager => 'salary - المدير',
+        AppRole.superadmin => 'salary - سوبر أدمن',
         null => 'salary',
       },
       debugShowCheckedModeBanner: false,
@@ -62,7 +69,682 @@ class SalaryApp extends StatelessWidget {
   }
 }
 
-enum AppRole { employee, manager }
+enum AppRole { employee, manager, superadmin }
+
+class CloudRoleGate extends StatefulWidget {
+  const CloudRoleGate({required this.role, super.key});
+
+  final String role;
+
+  @override
+  State<CloudRoleGate> createState() => _CloudRoleGateState();
+}
+
+class _CloudRoleGateState extends State<CloudRoleGate> {
+  CloudAppSession? _session;
+  Timer? _heartbeatTimer;
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _restoreSession();
+  }
+
+  Future<void> _restoreSession() async {
+    if (!CloudBackend.isConfigured) {
+      setState(() {
+        _loading = false;
+        _error = 'لم يتم إعداد اتصال قاعدة البيانات السحابية.';
+      });
+      return;
+    }
+    try {
+      final session = await CloudBackend.restoreSession();
+      if (!mounted) return;
+      if (session != null && session.role == widget.role) {
+        _setSession(session);
+      } else {
+        if (session != null) await CloudBackend.logout(session);
+        setState(() => _loading = false);
+      }
+    } on Exception catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = 'تعذر الاتصال بالخادم: $error';
+        });
+      }
+    }
+  }
+
+  void _setSession(CloudAppSession session) {
+    _heartbeatTimer?.cancel();
+    setState(() {
+      _session = session;
+      _loading = false;
+      _error = null;
+    });
+    _heartbeatTimer = Timer.periodic(
+      const Duration(minutes: 1),
+      (_) => _refreshSession(session),
+    );
+  }
+
+  Future<void> _refreshSession(CloudAppSession session) async {
+    try {
+      await CloudBackend.heartbeat(session);
+    } on Exception catch (error) {
+      _heartbeatTimer?.cancel();
+      if (mounted) {
+        setState(() {
+          _session = null;
+          _error = error.toString();
+        });
+      }
+    }
+  }
+
+  Future<void> _signIn(String username, String password) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final session = await CloudBackend.login(
+        role: widget.role,
+        username: username,
+        password: password,
+      );
+      if (mounted) _setSession(session);
+    } on Exception catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = error.toString();
+        });
+      }
+    }
+  }
+
+  Future<void> _signOut() async {
+    final session = _session;
+    if (session == null) return;
+    setState(() => _loading = true);
+    try {
+      await CloudBackend.logout(session);
+      _heartbeatTimer?.cancel();
+      if (mounted) {
+        setState(() {
+          _session = null;
+          _loading = false;
+          _error = null;
+        });
+      }
+    } on Exception catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = 'تعذر تسجيل الخروج من الخادم: $error';
+        });
+      }
+    }
+  }
+
+  @override
+  void dispose() {
+    _heartbeatTimer?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_loading) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_session case final session?) {
+      Future<void> onLogout() async {
+        await _signOut();
+        if (context.mounted) {
+          Navigator.of(context).popUntil((route) => route.isFirst);
+        }
+      }
+
+      if (session.role == 'superadmin') {
+        return SuperAdminPage(session: session, onLogout: onLogout);
+      }
+      if (session.role == 'manager') {
+        return EmployeesPage(
+          store: EmployeeStore(cloudSession: session),
+          userName: session.companyName,
+          appTitle: 'تطبيق المدير',
+          onLogout: onLogout,
+        );
+      }
+      return EmployeeSelectionPage(
+        store: EmployeeStore(cloudSession: session),
+        onLogout: onLogout,
+      );
+    }
+    if (!CloudBackend.isConfigured) {
+      return const _BackendSetupPage();
+    }
+    return _CloudLoginPage(
+      role: widget.role,
+      error: _error,
+      onLogin: _signIn,
+    );
+  }
+}
+
+class _BackendSetupPage extends StatelessWidget {
+  const _BackendSetupPage();
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: const Text('إعداد الاتصال')),
+        body: const Center(
+          child: Padding(
+            padding: EdgeInsets.all(24),
+            child: Text(
+              'أضف SUPABASE_URL ومعه SUPABASE_PUBLISHABLE_KEY أو SUPABASE_ANON_KEY عند البناء.',
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+}
+
+class _CloudLoginPage extends StatefulWidget {
+  const _CloudLoginPage({
+    required this.role,
+    required this.onLogin,
+    this.error,
+  });
+
+  final String role;
+  final String? error;
+  final Future<void> Function(String username, String password) onLogin;
+
+  @override
+  State<_CloudLoginPage> createState() => _CloudLoginPageState();
+}
+
+class _CloudLoginPageState extends State<_CloudLoginPage> {
+  final _formKey = GlobalKey<FormState>();
+  final _username = TextEditingController();
+  final _password = TextEditingController();
+  bool _submitting = false;
+
+  @override
+  void dispose() {
+    _username.dispose();
+    _password.dispose();
+    super.dispose();
+  }
+
+  String get _title => switch (widget.role) {
+        'manager' => 'تسجيل دخول المدير',
+        'employee' => 'ربط تطبيق الموظفين بالمؤسسة',
+        _ => 'تسجيل دخول سوبر أدمن',
+      };
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    setState(() => _submitting = true);
+    await widget.onLogin(_username.text, _password.text);
+    if (mounted) setState(() => _submitting = false);
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(title: Text(_title)),
+        body: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 420),
+              child: Form(
+                key: _formKey,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.business_outlined, size: 64),
+                    const SizedBox(height: 16),
+                    Text(_title, style: Theme.of(context).textTheme.titleLarge),
+                    const SizedBox(height: 24),
+                    TextFormField(
+                      controller: _username,
+                      autofocus: true,
+                      decoration: const InputDecoration(
+                        labelText: 'اسم المستخدم',
+                      ),
+                      validator: (value) =>
+                          value == null || value.trim().isEmpty
+                              ? 'أدخل اسم المستخدم'
+                              : null,
+                      onFieldSubmitted: (_) => _submit(),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _password,
+                      obscureText: true,
+                      decoration: const InputDecoration(
+                        labelText: 'كلمة المرور',
+                      ),
+                      validator: (value) => value == null || value.isEmpty
+                          ? 'أدخل كلمة المرور'
+                          : null,
+                      onFieldSubmitted: (_) => _submit(),
+                    ),
+                    if (widget.role == 'employee') ...[
+                      const SizedBox(height: 12),
+                      const Text(
+                        'استخدم بيانات الموظفين التي أنشأها سوبر أدمن للمؤسسة. سيتم ربط هذا الجهاز بها.',
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
+                    if (widget.error != null) ...[
+                      const SizedBox(height: 16),
+                      Text(
+                        widget.error!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                    const SizedBox(height: 20),
+                    SizedBox(
+                      width: double.infinity,
+                      child: FilledButton(
+                        onPressed: _submitting ? null : _submit,
+                        child: _submitting
+                            ? const CircularProgressIndicator()
+                            : const Text('تسجيل الدخول'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+}
+
+class SuperAdminPage extends StatefulWidget {
+  const SuperAdminPage({
+    required this.session,
+    required this.onLogout,
+    super.key,
+  });
+
+  final CloudAppSession session;
+  final Future<void> Function() onLogout;
+
+  @override
+  State<SuperAdminPage> createState() => _SuperAdminPageState();
+}
+
+class _SuperAdminPageState extends State<SuperAdminPage> {
+  late Future<List<Map<String, dynamic>>> _companies;
+
+  @override
+  void initState() {
+    super.initState();
+    _companies = CloudDataStore(widget.session).listCompanies();
+  }
+
+  void _reload() {
+    setState(() => _companies = CloudDataStore(widget.session).listCompanies());
+  }
+
+  Future<void> _editCompany([Map<String, dynamic>? company]) async {
+    final details = await showDialog<_CompanyFormData>(
+      context: context,
+      builder: (_) => _CompanyEditorDialog(company: company),
+    );
+    if (details == null || !mounted) return;
+    try {
+      final store = CloudDataStore(widget.session);
+      if (company == null) {
+        await store.createCompany(
+          name: details.name,
+          employeeUsername: details.employeeUsername,
+          employeePassword: details.employeePassword,
+          managerUsername: details.managerUsername,
+          managerPassword: details.managerPassword,
+        );
+      } else {
+        await store.updateCompany(
+          companyId: company['id'] as String,
+          active: details.isActive,
+          employeeUsername: details.employeeUsername,
+          employeePassword: details.employeePassword,
+          managerUsername: details.managerUsername,
+          managerPassword: details.managerPassword,
+        );
+      }
+      _reload();
+    } on Exception catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر حفظ بيانات المؤسسة: $error')),
+        );
+      }
+    }
+  }
+
+  Future<void> _toggleCompany(
+    Map<String, dynamic> company,
+    bool active,
+  ) async {
+    try {
+      await CloudDataStore(widget.session).updateCompany(
+        companyId: company['id'] as String,
+        active: active,
+        employeeUsername: company['employee_username'] as String,
+        employeePassword: '',
+        managerUsername: company['manager_username'] as String,
+        managerPassword: '',
+      );
+      _reload();
+    } on Exception catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر تغيير حالة المؤسسة: $error')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => Scaffold(
+        appBar: AppBar(
+          title: _homeAppBarTitle(
+            widget.session.username,
+            appTitle: 'سوبر أدمن',
+          ),
+          actions: [
+            IconButton(
+              tooltip: 'تسجيل الخروج',
+              onPressed: widget.onLogout,
+              icon: const Icon(Icons.logout),
+            ),
+          ],
+        ),
+        floatingActionButton: FloatingActionButton.extended(
+          onPressed: _editCompany,
+          icon: const Icon(Icons.add_business),
+          label: const Text('إضافة مؤسسة'),
+        ),
+        body: FutureBuilder<List<Map<String, dynamic>>>(
+          future: _companies,
+          builder: (context, snapshot) {
+            if (snapshot.hasError) {
+              return Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text('تعذر تحميل المؤسسات'),
+                    const SizedBox(height: 8),
+                    OutlinedButton(
+                      onPressed: _reload,
+                      child: const Text('إعادة المحاولة'),
+                    ),
+                  ],
+                ),
+              );
+            }
+            if (!snapshot.hasData) {
+              return const Center(child: CircularProgressIndicator());
+            }
+            final companies = snapshot.data!;
+            if (companies.isEmpty) {
+              return const Center(
+                child: Text('لا توجد مؤسسات بعد. أضف مؤسسة للبدء.'),
+              );
+            }
+            return ListView.separated(
+              padding: const EdgeInsets.fromLTRB(16, 16, 16, 96),
+              itemCount: companies.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, index) {
+                final company = companies[index];
+                final active = company['is_active'] as bool;
+                return Card(
+                  child: Column(
+                    children: [
+                      ListTile(
+                        leading: Icon(
+                          active ? Icons.business : Icons.business_outlined,
+                        ),
+                        title: Text(company['name'] as String),
+                        onTap: () => _editCompany(company),
+                        trailing: Switch(
+                          value: active,
+                          onChanged: (value) => _toggleCompany(company, value),
+                        ),
+                      ),
+                      const Divider(height: 1),
+                      Padding(
+                        padding: const EdgeInsetsDirectional.fromSTEB(
+                          72,
+                          12,
+                          16,
+                          16,
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const Text(
+                              'حساب الموظفين',
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            SelectableText(
+                              'المستخدم: ${company['employee_username']}',
+                            ),
+                            SelectableText(
+                              'كلمة المرور: ${company['employee_password']}',
+                            ),
+                            const SizedBox(height: 8),
+                            const Text(
+                              'حساب المدير',
+                              style: TextStyle(fontWeight: FontWeight.bold),
+                            ),
+                            SelectableText(
+                              'المستخدم: ${company['manager_username']}',
+                            ),
+                            SelectableText(
+                              'كلمة المرور: ${company['manager_password']}',
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            );
+          },
+        ),
+      );
+}
+
+class _CompanyFormData {
+  const _CompanyFormData({
+    required this.name,
+    required this.employeeUsername,
+    required this.employeePassword,
+    required this.managerUsername,
+    required this.managerPassword,
+    required this.isActive,
+  });
+
+  final String name;
+  final String employeeUsername;
+  final String employeePassword;
+  final String managerUsername;
+  final String managerPassword;
+  final bool? isActive;
+}
+
+class _CompanyEditorDialog extends StatefulWidget {
+  const _CompanyEditorDialog({this.company});
+
+  final Map<String, dynamic>? company;
+
+  @override
+  State<_CompanyEditorDialog> createState() => _CompanyEditorDialogState();
+}
+
+class _CompanyEditorDialogState extends State<_CompanyEditorDialog> {
+  final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _name;
+  late final TextEditingController _employeeUsername;
+  late final TextEditingController _employeePassword;
+  late final TextEditingController _managerUsername;
+  late final TextEditingController _managerPassword;
+  bool _active = true;
+
+  @override
+  void initState() {
+    super.initState();
+    final company = widget.company;
+    _name = TextEditingController(text: company?['name'] as String? ?? '');
+    _employeeUsername = TextEditingController(
+      text: company?['employee_username'] as String? ?? '',
+    );
+    _employeePassword = TextEditingController(
+      text: company?['employee_password'] as String? ?? '',
+    );
+    _managerUsername = TextEditingController(
+      text: company?['manager_username'] as String? ?? '',
+    );
+    _managerPassword = TextEditingController(
+      text: company?['manager_password'] as String? ?? '',
+    );
+    _active = company?['is_active'] as bool? ?? true;
+  }
+
+  @override
+  void dispose() {
+    _name.dispose();
+    _employeeUsername.dispose();
+    _employeePassword.dispose();
+    _managerUsername.dispose();
+    _managerPassword.dispose();
+    super.dispose();
+  }
+
+  String? _required(String? value) =>
+      value == null || value.trim().isEmpty ? 'هذا الحقل مطلوب' : null;
+
+  String? _passwordValidator(String? value) {
+    if (widget.company != null && (value == null || value.isEmpty)) return null;
+    if (value == null || value.length < 8) {
+      return 'كلمة المرور 8 أحرف على الأقل';
+    }
+    return null;
+  }
+
+  void _submit() {
+    if (!_formKey.currentState!.validate()) return;
+    Navigator.of(context).pop(
+      _CompanyFormData(
+        name: _name.text.trim(),
+        employeeUsername: _employeeUsername.text.trim(),
+        employeePassword: _employeePassword.text,
+        managerUsername: _managerUsername.text.trim(),
+        managerPassword: _managerPassword.text,
+        isActive: widget.company == null ? null : _active,
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) => AlertDialog(
+        title: Text(widget.company == null ? 'إضافة مؤسسة' : 'إعدادات المؤسسة'),
+        content: SizedBox(
+          width: 440,
+          child: Form(
+            key: _formKey,
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (widget.company == null)
+                    TextFormField(
+                      controller: _name,
+                      decoration: const InputDecoration(
+                        labelText: 'اسم المؤسسة',
+                      ),
+                      validator: _required,
+                    ),
+                  TextFormField(
+                    controller: _employeeUsername,
+                    decoration: const InputDecoration(
+                      labelText: 'اسم مستخدم الموظفين',
+                    ),
+                    validator: _required,
+                  ),
+                  TextFormField(
+                    controller: _employeePassword,
+                    decoration: InputDecoration(
+                      labelText: widget.company == null
+                          ? 'كلمة مرور الموظفين'
+                          : 'كلمة مرور جديدة للموظفين (اختياري)',
+                    ),
+                    validator: _passwordValidator,
+                  ),
+                  TextFormField(
+                    controller: _managerUsername,
+                    decoration: const InputDecoration(
+                      labelText: 'اسم مستخدم المدير',
+                    ),
+                    validator: _required,
+                  ),
+                  TextFormField(
+                    controller: _managerPassword,
+                    decoration: InputDecoration(
+                      labelText: widget.company == null
+                          ? 'كلمة مرور المدير'
+                          : 'كلمة مرور جديدة للمدير (اختياري)',
+                    ),
+                    validator: _passwordValidator,
+                  ),
+                  if (widget.company != null)
+                    SwitchListTile(
+                      contentPadding: EdgeInsets.zero,
+                      title: const Text('المؤسسة مفعلة'),
+                      value: _active,
+                      onChanged: (value) => setState(() => _active = value),
+                    ),
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: Text(
+                      'تُشفّر كلمات المرور في قاعدة البيانات بمفتاح محفوظ في Supabase Vault.',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('إلغاء'),
+          ),
+          FilledButton(
+            onPressed: _submit,
+            child: Text(widget.company == null ? 'إنشاء المؤسسة' : 'حفظ'),
+          ),
+        ],
+      );
+}
 
 class SharedSalaryDirectory {
   static Future<Directory> get() async {
@@ -198,7 +880,13 @@ class _RoleGateState extends State<RoleGate> {
   @override
   Widget build(BuildContext context) {
     if (widget.fixedRole == AppRole.employee) {
-      return EmployeeSelectionPage(store: EmployeeStore(shared: true));
+      return const CloudRoleGate(role: 'employee');
+    }
+    if (widget.fixedRole == AppRole.manager) {
+      return const CloudRoleGate(role: 'manager');
+    }
+    if (widget.fixedRole == AppRole.superadmin) {
+      return const CloudRoleGate(role: 'superadmin');
     }
     return FutureBuilder<AppSettings?>(
       future: _settingsFuture,
@@ -451,10 +1139,11 @@ Widget _homeAppBarTitle(String? userName, {String appTitle = 'salary'}) {
 }
 
 class EmployeeStore {
-  EmployeeStore({this.directory, this.shared = false});
+  EmployeeStore({this.directory, this.shared = false, this.cloudSession});
 
   final Directory? directory;
   final bool shared;
+  final CloudAppSession? cloudSession;
 
   Future<Directory> _employeesDirectory() async {
     final customDirectory = directory;
@@ -475,6 +1164,11 @@ class EmployeeStore {
   }
 
   Future<List<EmployeeRecord>> loadEmployees() async {
+    final cloud = cloudSession;
+    if (cloud != null) {
+      final records = await CloudDataStore(cloud).loadEmployees();
+      return records.map((record) => EmployeeRecord.fromJson(record)).toList();
+    }
     final root = await _employeesDirectory();
     final entities = await root.list(followLinks: false).toList();
     final employees = <EmployeeRecord>[];
@@ -497,6 +1191,12 @@ class EmployeeStore {
     final normalizedName = name.trim();
     if (normalizedName.isEmpty) {
       throw ArgumentError.value(name, 'name', 'Employee name is required');
+    }
+    final cloud = cloudSession;
+    if (cloud != null) {
+      return EmployeeRecord.fromJson(
+        await CloudDataStore(cloud).createEmployee(normalizedName),
+      );
     }
     final root = await _employeesDirectory();
     final safeName = Uri.encodeComponent(normalizedName)
@@ -527,9 +1227,10 @@ class EmployeeStore {
 }
 
 class EmployeeSelectionPage extends StatefulWidget {
-  const EmployeeSelectionPage({required this.store, super.key});
+  const EmployeeSelectionPage({required this.store, this.onLogout, super.key});
 
   final EmployeeStore store;
+  final Future<void> Function()? onLogout;
 
   @override
   State<EmployeeSelectionPage> createState() => _EmployeeSelectionPageState();
@@ -546,15 +1247,23 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
 
   Future<void> _openEmployee(EmployeeRecord employee) async {
     try {
-      final directory = await widget.store.monthsDirectory(employee);
+      final directory = widget.store.cloudSession == null
+          ? await widget.store.monthsDirectory(employee)
+          : null;
       if (!mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => MonthsPage(
-            store: MonthStore(directory: directory),
+            store: directory != null
+                ? MonthStore(directory: directory)
+                : MonthStore(
+                    cloudSession: widget.store.cloudSession,
+                    employeeId: employee.id,
+                  ),
             userName: employee.name,
             appTitle: 'تطبيق الموظفين',
             employeeMode: true,
+            onLogout: widget.onLogout,
           ),
         ),
       );
@@ -562,6 +1271,12 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('تعذر فتح سجل الموظف: ${error.message}')),
+        );
+      }
+    } on Exception catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر فتح سجل الموظف: $error')),
         );
       }
     }
@@ -582,6 +1297,12 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
             },
             icon: const Icon(Icons.refresh),
           ),
+          if (widget.onLogout != null)
+            IconButton(
+              tooltip: 'تسجيل الخروج',
+              onPressed: widget.onLogout,
+              icon: const Icon(Icons.logout),
+            ),
         ],
       ),
       body: FutureBuilder<List<EmployeeRecord>>(
@@ -625,7 +1346,7 @@ class _EmployeeSelectionPageState extends State<EmployeeSelectionPage> {
                     child: Icon(Icons.person_outline),
                   ),
                   title: Text(employee.name),
-                  subtitle: const Text('فتح سجل الحضور والراتب'),
+                  subtitle: const Text('فتح سجل الحضور وساعات العمل'),
                   trailing: const Icon(Icons.chevron_left),
                   onTap: () => _openEmployee(employee),
                 ),
@@ -644,11 +1365,13 @@ class EmployeesPage extends StatefulWidget {
     this.store,
     this.userName,
     this.appTitle = 'salary',
+    this.onLogout,
   });
 
   final EmployeeStore? store;
   final String? userName;
   final String appTitle;
+  final Future<void> Function()? onLogout;
 
   @override
   State<EmployeesPage> createState() => _EmployeesPageState();
@@ -732,24 +1455,36 @@ class _EmployeesPageState extends State<EmployeesPage> {
       });
     } on FileSystemException catch (error) {
       if (mounted) _showMessage('تعذر إضافة الموظف: ${error.message}');
+    } on Exception catch (error) {
+      if (mounted) _showMessage('تعذر إضافة الموظف: $error');
     }
   }
 
   Future<void> _openEmployee(EmployeeRecord employee) async {
     try {
-      final directory = await _employeeStore.monthsDirectory(employee);
+      final directory = _employeeStore.cloudSession == null
+          ? await _employeeStore.monthsDirectory(employee)
+          : null;
       if (!mounted) return;
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => MonthsPage(
-            store: MonthStore(directory: directory),
+            store: directory != null
+                ? MonthStore(directory: directory)
+                : MonthStore(
+                    cloudSession: _employeeStore.cloudSession,
+                    employeeId: employee.id,
+                  ),
             userName: widget.userName,
             appTitle: widget.appTitle,
+            onLogout: widget.onLogout,
           ),
         ),
       );
     } on FileSystemException catch (error) {
       if (mounted) _showMessage('تعذر فتح سجل الموظف: ${error.message}');
+    } on Exception catch (error) {
+      if (mounted) _showMessage('تعذر فتح سجل الموظف: $error');
     }
   }
 
@@ -764,6 +1499,14 @@ class _EmployeesPageState extends State<EmployeesPage> {
     return Scaffold(
       appBar: AppBar(
         title: _homeAppBarTitle(widget.userName, appTitle: widget.appTitle),
+        actions: [
+          if (widget.onLogout != null)
+            IconButton(
+              tooltip: 'تسجيل الخروج',
+              onPressed: widget.onLogout,
+              icon: const Icon(Icons.logout),
+            ),
+        ],
       ),
       floatingActionButton: Row(
         mainAxisSize: MainAxisSize.min,
@@ -1071,10 +1814,20 @@ int _minutesFromTime(String value) {
 }
 
 class MonthStore {
-  MonthStore({this.directory});
+  MonthStore({this.directory, this.cloudSession, this.employeeId});
 
   final Directory? directory;
+  final CloudAppSession? cloudSession;
+  final String? employeeId;
   Future<void> _saveQueue = Future<void>.value();
+
+  String get _cloudEmployeeId {
+    final id = employeeId;
+    if (id == null) {
+      throw StateError('Cloud month storage needs an employee ID');
+    }
+    return id;
+  }
 
   Future<Directory> _monthsDirectory() async {
     final customDirectory = directory;
@@ -1089,6 +1842,11 @@ class MonthStore {
   }
 
   Future<List<MonthRecord>> loadMonths() async {
+    final cloud = cloudSession;
+    if (cloud != null) {
+      final records = await CloudDataStore(cloud).loadMonths(_cloudEmployeeId);
+      return records.map(MonthRecord.fromJson).toList();
+    }
     final directory = await _monthsDirectory();
     final entities = await directory.list(followLinks: false).toList();
     final records = <MonthRecord>[];
@@ -1104,6 +1862,14 @@ class MonthStore {
 
   Future<void> save(MonthRecord record) {
     final write = _saveQueue.then((_) async {
+      final cloud = cloudSession;
+      if (cloud != null) {
+        await CloudDataStore(cloud).saveMonth(
+          _cloudEmployeeId,
+          record.toJson(),
+        );
+        return;
+      }
       final root = await _monthsDirectory();
       final directory = Directory('${root.path}/${record.id}');
       await directory.create(recursive: true);
@@ -1120,6 +1886,15 @@ class MonthStore {
     final operation = _saveQueue.then((_) async {
       if (!RegExp(r'^\d{4}-(0[1-9]|1[0-2])$').hasMatch(record.id)) {
         throw ArgumentError.value(record.id, 'record.id', 'Invalid month ID');
+      }
+      final cloud = cloudSession;
+      if (cloud != null) {
+        await CloudDataStore(cloud).deleteMonth(
+          _cloudEmployeeId,
+          record.year,
+          record.month,
+        );
+        return;
       }
       final root = await _monthsDirectory();
       final directory = Directory('${root.path}/${record.id}');
@@ -1138,6 +1913,7 @@ class MonthsPage extends StatefulWidget {
     this.userName,
     this.appTitle = 'salary',
     this.employeeMode = false,
+    this.onLogout,
     super.key,
   });
 
@@ -1145,6 +1921,7 @@ class MonthsPage extends StatefulWidget {
   final String? userName;
   final String appTitle;
   final bool employeeMode;
+  final Future<void> Function()? onLogout;
 
   @override
   State<MonthsPage> createState() => _MonthsPageState();
@@ -1186,6 +1963,8 @@ class _MonthsPageState extends State<MonthsPage> {
       });
     } on FileSystemException catch (error) {
       if (mounted) _showMessage('تعذر حفظ الشهر: ${error.message}');
+    } on Exception catch (error) {
+      if (mounted) _showMessage('تعذر حفظ الشهر: $error');
     }
   }
 
@@ -1255,6 +2034,8 @@ class _MonthsPageState extends State<MonthsPage> {
       _showMessage('تم حذف الشهر');
     } on FileSystemException catch (error) {
       if (mounted) _showMessage('تعذر حذف الشهر: ${error.message}');
+    } on Exception catch (error) {
+      if (mounted) _showMessage('تعذر حذف الشهر: $error');
     }
   }
 
@@ -1269,6 +2050,14 @@ class _MonthsPageState extends State<MonthsPage> {
     return Scaffold(
       appBar: AppBar(
         title: _homeAppBarTitle(widget.userName, appTitle: widget.appTitle),
+        actions: [
+          if (widget.onLogout != null)
+            IconButton(
+              tooltip: 'تسجيل الخروج',
+              onPressed: widget.onLogout,
+              icon: const Icon(Icons.logout),
+            ),
+        ],
       ),
       floatingActionButton: Row(
         mainAxisSize: MainAxisSize.min,
@@ -1484,6 +2273,12 @@ class _MonthPageState extends State<MonthPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('تعذر حفظ البيانات: ${error.message}')),
+        );
+      }
+    } on Exception catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('تعذر حفظ البيانات: $error')),
         );
       }
     } finally {
