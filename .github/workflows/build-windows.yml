@@ -11,9 +11,9 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      SUPABASE_URL: ${{ vars.SUPABASE_URL }}
-      SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
-      SUPABASE_ANON_KEY: ${{ vars.SUPABASE_ANON_KEY }}
+      SUPABASE_URL: https://hcelkgycbbheavqkbfes.supabase.co
+      SUPABASE_ANON_KEY: >-
+        eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhjZWxrZ3ljYmJoZWF2cWtiZmVzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE2Mzc3OTcsImV4cCI6MjEwNzIxMzc5N30.Cs_CGvru9fkj5AqTLxzFX--XgLw10rD3NYwjcjZXl_U
 
     steps:
       - name: Check out repository
